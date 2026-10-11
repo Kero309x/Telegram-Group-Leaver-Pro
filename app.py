@@ -1,5 +1,9 @@
 import asyncio
+import functools
+import hmac
+import math
 import os
+import re
 import socket
 import threading
 import time
@@ -39,6 +43,185 @@ def run_background_loop(loop_to_run):
     loop_to_run.run_forever()
 
 threading.Thread(target=run_background_loop, args=(loop,), daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
+# Server-side input validation helpers.
+# They raise InputValidationError; @json_errors turns that into a 400 JSON
+# reply so bad input never produces an HTML 500/400 page the frontend would
+# surface as a bogus "Network Error".
+# ---------------------------------------------------------------------------
+
+MAX_TASK_IDS = 5000
+
+
+class InputValidationError(ValueError):
+    """Raised by the _get_* helpers; routes convert it to 400 JSON."""
+
+
+def _get_str(data: Dict[str, Any], key: str, default: str = "", max_len: int = 256,
+             required: bool = False, pattern: str = None) -> str:
+    """Reads a bounded string from the request payload."""
+    raw = data.get(key, default)
+    if raw is None:
+        raw = default
+    if isinstance(raw, bool) or not isinstance(raw, (str, int, float)):
+        raise InputValidationError(f"{key} must be a string")
+    if not isinstance(raw, str):
+        raw = str(raw)
+    value = raw.strip()
+    if required and not value:
+        raise InputValidationError(f"{key} is required")
+    if len(value) > max_len:
+        raise InputValidationError(f"{key} must be at most {max_len} characters")
+    if pattern and value and not re.fullmatch(pattern, value):
+        raise InputValidationError(f"{key} has an invalid format")
+    return value
+
+
+def _get_int(data: Dict[str, Any], key: str, default, lo: int, hi: int) -> int:
+    """Reads an integer from the payload, rejecting anything out of range."""
+    raw = data.get(key, default)
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        raw = default
+    if isinstance(raw, bool):
+        raise InputValidationError(f"{key} must be an integer")
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        raise InputValidationError(f"{key} must be an integer")
+    if value < lo or value > hi:
+        raise InputValidationError(f"{key} must be between {lo} and {hi}")
+    return value
+
+
+def _get_float(data: Dict[str, Any], key: str, default, lo: float, hi: float) -> float:
+    """Reads a finite float from the payload, rejecting anything out of range."""
+    raw = data.get(key, default)
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        raw = default
+    if isinstance(raw, bool):
+        raise InputValidationError(f"{key} must be a number")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise InputValidationError(f"{key} must be a number between {lo} and {hi}")
+    if not math.isfinite(value):
+        raise InputValidationError(f"{key} must be a finite number")
+    if value < lo or value > hi:
+        raise InputValidationError(f"{key} must be between {lo} and {hi}")
+    return value
+
+
+def _get_delays(data: Dict[str, Any], default_min, default_max):
+    """Validates the min/max execution delay pair."""
+    min_delay = _get_float(data, "min_delay", default_min, 0, 60)
+    max_delay = _get_float(data, "max_delay", default_max, 0, 120)
+    if min_delay > max_delay:
+        raise InputValidationError("min_delay cannot be greater than max_delay")
+    return min_delay, max_delay
+
+
+def _get_id_list(data: Dict[str, Any], key: str) -> List[str]:
+    """Validates a bounded list of dialog ids (strings or ints only)."""
+    raw = data.get(key) or []
+    if not isinstance(raw, list):
+        raise InputValidationError(f"{key} must be a list")
+    if len(raw) > MAX_TASK_IDS:
+        raise InputValidationError(f"{key} may contain at most {MAX_TASK_IDS} entries")
+    ids = []
+    for item in raw:
+        if isinstance(item, bool) or not isinstance(item, (str, int)):
+            raise InputValidationError(f"{key} must contain only dialog ids")
+        text = str(item).strip()
+        if not text or len(text) > 64:
+            raise InputValidationError(f"{key} contains an invalid dialog id")
+        ids.append(text)
+    return ids
+
+
+def sanitize_phone_digits(phone) -> str:
+    """Extracts digits only so a phone number can never escape tg_sessions/.
+
+    Returns None when the result is not a plausible phone length; callers
+    must treat that as a validation failure.
+    """
+    digits = re.sub(r"\D", "", str(phone or ""))
+    if len(digits) < 7 or len(digits) > 15:
+        return None
+    return digits
+
+
+def json_errors(fn):
+    """Converts InputValidationError into a clean 400 JSON response."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except InputValidationError as exc:
+            return jsonify({"status": "error", "error": str(exc), "message": str(exc)}), 400
+    return wrapper
+
+
+# ---------------------------------------------------------------------------
+# Optional dashboard PIN lock (env DASHBOARD_PIN). Zero behaviour change
+# when the variable is unset or empty.
+# ---------------------------------------------------------------------------
+
+PIN_EXEMPT_PATHS = ("/", "/robots.txt", "/sitemap.xml")
+
+
+def _dashboard_pin() -> str:
+    return os.environ.get("DASHBOARD_PIN", "").strip()
+
+
+@app.before_request
+def require_dashboard_pin():
+    """Gates every /api/* route behind X-Dashboard-Pin when DASHBOARD_PIN is set."""
+    pin = _dashboard_pin()
+    if not pin:
+        return None
+    path = request.path
+    if not path.startswith("/api/"):
+        return None
+    if path in PIN_EXEMPT_PATHS or path.startswith("/static/"):
+        return None
+    supplied = request.headers.get("X-Dashboard-Pin", "")
+    if not hmac.compare_digest(supplied.encode("utf-8"), pin.encode("utf-8")):
+        return jsonify({"status": "error", "error": "pin_required",
+                        "message": "Dashboard PIN required."}), 401
+    return None
+
+
+# ---------------------------------------------------------------------------
+# send_code abuse protection: in-memory per-IP cooldown (1 attempt / 60s).
+# ---------------------------------------------------------------------------
+
+SEND_CODE_COOLDOWN_SECONDS = 60
+_send_code_last_attempt: Dict[str, float] = {}
+
+
+def _client_ip() -> str:
+    """Best-effort client IP (honours X-Forwarded-For when behind a proxy)."""
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()[:64]
+    return (request.remote_addr or "unknown")[:64]
+
+
+def _send_code_rate_limited() -> bool:
+    """Returns True when this IP must wait; records the attempt otherwise."""
+    now = time.time()
+    ip = _client_ip()
+    for key, ts in list(_send_code_last_attempt.items()):
+        if now - ts >= SEND_CODE_COOLDOWN_SECONDS:
+            _send_code_last_attempt.pop(key, None)
+    last = _send_code_last_attempt.get(ip)
+    if last is not None and (now - last) < SEND_CODE_COOLDOWN_SECONDS:
+        return True
+    _send_code_last_attempt[ip] = now
+    return False
+
 
 
 @app.after_request
@@ -118,6 +301,94 @@ def entity_display_name(entity) -> str:
     if username:
         return f"@{username}"
     return str(entity.id)
+
+
+# ---------------------------------------------------------------------------
+# Session lifecycle: tasks disconnect their client in `finally` while the
+# entry stays in sessions_store, so every code path that reuses a stored
+# client must go through ensure_connected / run_with_connection_retry first.
+# ---------------------------------------------------------------------------
+
+class SessionExpiredError(Exception):
+    """A stored Telethon session can no longer be revived (login is gone)."""
+
+
+async def ensure_connected(session_entry, force_reconnect=False, require_authorized=True):
+    """Lazily (re)connects a stored client and verifies it is still usable.
+
+    Connection state is mirrored in ``session_entry["connected"]`` and the
+    authorization state in ``session_entry["authorized"]``. Raises
+    SessionExpiredError when the login itself is gone (routes turn that into
+    a 401 {"error": "session_expired"}) and ConnectionError when the
+    transport cannot be re-established.
+    """
+    client = session_entry.get("client")
+    if client is None:
+        session_entry["connected"] = False
+        raise SessionExpiredError("session has no client attached")
+    try:
+        if force_reconnect and client.is_connected():
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            session_entry["connected"] = False
+        if not client.is_connected():
+            await client.connect()
+        authorized = await client.is_user_authorized()
+    except SessionExpiredError:
+        raise
+    except (ConnectionError, OSError) as exc:
+        session_entry["connected"] = False
+        raise ConnectionError(str(exc) or exc.__class__.__name__) from exc
+    except Exception as exc:
+        # A rejected/revoked auth key surfaces as an RPC error during the
+        # authorization probe; treat it as a login problem, not a transport one.
+        session_entry["connected"] = bool(client.is_connected())
+        session_entry["authorized"] = False
+        raise SessionExpiredError(str(exc)) from exc
+    session_entry["connected"] = True
+    session_entry["authorized"] = authorized
+    if require_authorized and not authorized:
+        raise SessionExpiredError("telegram login is no longer valid")
+    return client
+
+
+async def _noop_operation(client):
+    """Placeholder operation used to validate a session without side effects."""
+    return None
+
+
+async def run_with_connection_retry(session_entry, operation, **ensure_kwargs):
+    """Runs ``operation(client)`` with connectivity guaranteed.
+
+    The first use is wrapped in exactly one retry: on ConnectionError the
+    client is force-reconnected and the operation retried once.
+    """
+    try:
+        client = await ensure_connected(session_entry, **ensure_kwargs)
+        return await operation(client)
+    except SessionExpiredError:
+        raise
+    except (ConnectionError, OSError):
+        client = await ensure_connected(session_entry, force_reconnect=True, **ensure_kwargs)
+        return await operation(client)
+
+
+def session_error_response(exc):
+    """Maps session/transport failures to clean JSON replies (never HTML)."""
+    if isinstance(exc, SessionExpiredError):
+        return jsonify({"status": "error", "error": "session_expired",
+                        "message": "Session expired. Please log in again."}), 401
+    if isinstance(exc, (ConnectionError, OSError)):
+        return jsonify({"status": "error", "error": "connection_failed",
+                        "message": "Could not reach Telegram just now. Please try again."}), 503
+    if isinstance(exc, TimeoutError):
+        return jsonify({"status": "error", "error": "timeout",
+                        "message": "The operation timed out. Please try again."}), 504
+    return jsonify({"status": "error", "error": "internal_error",
+                    "message": str(exc)}), 500
+
 
 
 async def execute_leave_or_delete(client: TelegramClient, entity, max_retries=3) -> tuple:
@@ -208,7 +479,7 @@ async def execute_leave_or_delete(client: TelegramClient, entity, max_retries=3)
     return False, "Max retries reached"
 
 
-async def execute_leaving_process(task_id: str, client: TelegramClient, targets: List[Any], bot_token: str, log_user_id: str):
+async def execute_leaving_process(task_id: str, client: TelegramClient, targets: List[Any], bot_token: str, log_user_id: str, session_entry=None):
     """Executes the batch removal process with real-time feedback."""
     task = tasks_store[task_id]
     total = len(targets)
@@ -224,6 +495,11 @@ async def execute_leaving_process(task_id: str, client: TelegramClient, targets:
     failed_count = 0
 
     try:
+        if session_entry is not None:
+            # Safety net: the client may have been disconnected between the
+            # route check and this coroutine actually starting.
+            await ensure_connected(session_entry)
+
         for idx, entity in enumerate(targets, start=1):
             if task.get("cancelled", False):
                 task["status"] = "cancelled"
@@ -289,10 +565,15 @@ async def execute_leaving_process(task_id: str, client: TelegramClient, targets:
             task["logs"].append(f"[{time.strftime('%H:%M:%S')}] Complete! Success: {left_count}, Failed: {failed_count}")
             await send_log_to_bot(bot_token, log_user_id, final_report)
 
+    except SessionExpiredError:
+        task["status"] = "error"
+        task["logs"].append(f"[{time.strftime('%H:%M:%S')}] Session expired - please log in again.")
     except Exception as e:
         task["status"] = "error"
         task["logs"].append(f"[{time.strftime('%H:%M:%S')}] Critical error: {str(e)}")
     finally:
+        if session_entry is not None:
+            session_entry["connected"] = False
         try:
             await client.disconnect()
         except Exception:
@@ -304,7 +585,7 @@ HTML_TEMPLATE = """
 <html lang="en" class="dark">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="theme-color" content="#020617">
     <title>TG Cleaner Pro - Bulk Leave Telegram Groups, Channels &amp; Bots</title>
     <meta name="description" content="Clean your Telegram account in one click: batch-leave unwanted channels and supergroups, block and wipe bots, with real MTProto API, speed control and live logs.">
@@ -714,6 +995,40 @@ HTML_TEMPLATE = """
         </div>
     </div>
 
+    <!-- Dashboard PIN Modal (only shown when the server requires X-Dashboard-Pin) -->
+    <div id="pin-modal" class="fixed inset-0 z-[70] bg-slate-950/80 backdrop-blur-md flex items-center justify-center p-4 hidden">
+        <div class="bg-slate-900 border border-slate-800 rounded-2xl max-w-sm w-full p-6 shadow-2xl space-y-4">
+            <div class="flex items-center space-x-3">
+                <div class="w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0 bg-amber-950 border border-amber-800 text-amber-400">
+                    <i class="fa-solid fa-lock text-base"></i>
+                </div>
+                <div>
+                    <h3 class="text-base font-bold text-slate-100">Dashboard PIN Required</h3>
+                    <p class="text-xs text-slate-400">Enter the dashboard PIN to unlock the API</p>
+                </div>
+            </div>
+            <input id="pin-input" type="password" inputmode="numeric" autocomplete="off" maxlength="64" placeholder="PIN" class="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-sm font-mono focus:border-cyan-500 focus:outline-none">
+            <div class="flex items-center justify-end gap-2.5 pt-1">
+                <button type="button" id="pin-cancel-btn" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold rounded-xl transition">
+                    Cancel
+                </button>
+                <button type="button" id="pin-submit-btn" class="px-5 py-2 bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-semibold rounded-xl transition shadow-lg shadow-cyan-500/25">
+                    Unlock
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Dialogs load-failure template (cloned by renderDialogsError, never interpolated HTML) -->
+    <template id="dialogs-error-template">
+        <div class="p-6 text-center space-y-3">
+            <p class="text-rose-400 text-sm" data-dialogs-error-msg></p>
+            <button type="button" id="retry-dialogs-btn" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold rounded-xl transition border border-slate-700/60">
+                <i class="fa-solid fa-rotate-right mr-1.5"></i> Retry
+            </button>
+        </div>
+    </template>
+
     <!-- Footer Credit -->
     <footer class="text-center text-xs text-slate-500 pt-6 pb-2 space-y-1">
         <p>Telegram Groups, Channels & Bots Cleaner • Engineered by <a href="https://github.com/Kero309x" target="_blank" class="text-slate-400 font-semibold hover:text-cyan-400 transition">@Kero309x</a></p>
@@ -756,6 +1071,81 @@ HTML_TEMPLATE = """
         function escapeHtml(value) {
             const entities = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
             return String(value).replace(/[&<>"']/g, ch => entities[ch]);
+        }
+
+        // ---- Optional dashboard PIN lock (active only when the server demands it) ----
+        const PIN_STORAGE_KEY = 'tg_dashboard_pin';
+        let pinPromptPromise = null;
+
+        function promptForDashboardPin() {
+            if (pinPromptPromise) return pinPromptPromise;
+            pinPromptPromise = new Promise(resolve => {
+                const modal = document.getElementById('pin-modal');
+                const input = document.getElementById('pin-input');
+                const finish = value => {
+                    if (modal) modal.classList.add('hidden');
+                    if (input) input.value = '';
+                    document.removeEventListener('keydown', onEscape);
+                    pinPromptPromise = null;
+                    resolve(value);
+                };
+                const onEscape = e => { if (e.key === 'Escape') finish(null); };
+                if (!modal || !input) { finish(null); return; }
+                document.getElementById('pin-submit-btn').onclick = () => {
+                    const entered = input.value.trim();
+                    if (!entered) { input.focus(); return; }
+                    finish(entered);
+                };
+                document.getElementById('pin-cancel-btn').onclick = () => finish(null);
+                input.onkeydown = e => {
+                    if (e.key === 'Enter') {
+                        e.preventDefault();
+                        document.getElementById('pin-submit-btn').click();
+                    }
+                };
+                document.addEventListener('keydown', onEscape);
+                modal.classList.remove('hidden');
+                input.focus();
+            });
+            return pinPromptPromise;
+        }
+
+        // Wrap the native fetch exactly once: attach the stored PIN header to
+        // every request and, on a pin_required 401, ask for the PIN and replay
+        // the failed request a single time (no retry loop).
+        const nativeFetch = window.fetch.bind(window);
+        window.fetch = async function (input, init) {
+            const opts = init ? Object.assign({}, init) : {};
+            const fallbackHeaders = (input && typeof input === 'object' && !(input instanceof Request)) ? input.headers : undefined;
+            const headers = new Headers(opts.headers || fallbackHeaders);
+            const storedPin = sessionStorage.getItem(PIN_STORAGE_KEY);
+            if (storedPin) headers.set('X-Dashboard-Pin', storedPin);
+            opts.headers = headers;
+
+            let res = await nativeFetch(input, opts);
+            if (res.status === 401) {
+                let payload = null;
+                try { payload = await res.clone().json(); } catch (e) {}
+                if (payload && payload.error === 'pin_required') {
+                    const entered = await promptForDashboardPin();
+                    if (entered) {
+                        sessionStorage.setItem(PIN_STORAGE_KEY, entered);
+                        headers.set('X-Dashboard-Pin', entered);
+                        res = await nativeFetch(input, opts); // single replay
+                        let second = null;
+                        try { second = await res.clone().json(); } catch (e) {}
+                        if (second && second.error === 'pin_required') {
+                            sessionStorage.removeItem(PIN_STORAGE_KEY);
+                            showToast('Dashboard PIN is incorrect', 'error');
+                        }
+                    }
+                }
+            }
+            return res;
+        };
+
+        function isSessionExpired(res, payload) {
+            return !!(res && res.status === 401 && payload && payload.error === 'session_expired');
         }
 
         function showToast(message, type = 'info') {
@@ -1154,6 +1544,25 @@ HTML_TEMPLATE = """
             }
         }
 
+        function renderDialogsError(message) {
+            const container = document.getElementById('chats-container');
+            const template = document.getElementById('dialogs-error-template');
+            container.textContent = '';
+            if (template) {
+                const node = template.content.cloneNode(true);
+                const msg = node.querySelector('[data-dialogs-error-msg]');
+                if (msg) msg.textContent = message;
+                const retry = node.querySelector('#retry-dialogs-btn');
+                if (retry) retry.addEventListener('click', () => loadChatsList());
+                container.appendChild(node);
+            } else {
+                const fallback = document.createElement('div');
+                fallback.className = 'p-6 text-center text-rose-400';
+                fallback.textContent = message;
+                container.appendChild(fallback);
+            }
+        }
+
         async function loadChatsList() {
             document.getElementById('step-select').classList.remove('hidden');
             renderChatSkeleton();
@@ -1164,12 +1573,15 @@ HTML_TEMPLATE = """
                 if (json.status === 'success') {
                     loadedChats = json.chats;
                     renderChats(loadedChats);
+                } else if (isSessionExpired(res, json)) {
+                    renderDialogsError('Session expired - please log in again.');
+                    showToast('Session expired - please log in again', 'error');
                 } else {
-                    document.getElementById('chats-container').innerHTML = `<div class="p-6 text-center text-rose-400">${json.message}</div>`;
+                    renderDialogsError(json.message || 'Failed to load dialogs');
                     showToast(json.message || 'Failed to load dialogs', 'error');
                 }
             } catch (e) {
-                document.getElementById('chats-container').innerHTML = `<div class="p-6 text-center text-rose-400">Failed to load dialogs: ${e}</div>`;
+                renderDialogsError('Failed to load dialogs: ' + String(e));
                 showToast('Failed to load dialogs: ' + String(e), 'error');
             }
         }
@@ -1193,27 +1605,30 @@ HTML_TEMPLATE = """
                 }
 
                 const isFav = favoriteIds.has(chat.id);
+                const safeId = escapeHtml(chat.id);
                 const safeName = escapeHtml(chat.name);
+                const safeType = escapeHtml(chat.type);
+                const safeUsername = chat.username ? escapeHtml(chat.username) : '';
 
                 return `
-                <div class="chat-row flex items-center justify-between p-3 sm:p-3.5 border-b border-l-2 border-slate-800/80 ${isFav ? 'border-l-amber-400/70 bg-amber-950/10' : 'border-l-transparent'} hover:bg-slate-900/60 active:bg-slate-900 transition cursor-pointer select-none" data-id="${chat.id}" data-type="${chat.type}" data-fav="${isFav ? '1' : '0'}" onclick="toggleRow(event, '${chat.id}')">
+                <div class="chat-row flex items-center justify-between p-3 sm:p-3.5 border-b border-l-2 border-slate-800/80 ${isFav ? 'border-l-amber-400/70 bg-amber-950/10' : 'border-l-transparent'} hover:bg-slate-900/60 active:bg-slate-900 transition cursor-pointer select-none" data-id="${safeId}" data-type="${safeType}" data-fav="${isFav ? '1' : '0'}" onclick="toggleRow(event, '${safeId}')">
                     <div class="flex items-center space-x-3 min-w-0 flex-1">
-                        <input type="checkbox" value="${chat.id}" data-type="${chat.type}" ${isFav ? 'disabled' : ''} aria-label="Select ${safeName} for cleanup" class="chat-checkbox w-5 h-5 sm:w-4 sm:h-4 rounded bg-slate-950 border-slate-700 text-cyan-500 focus:ring-0 focus:ring-offset-0 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed" onclick="event.stopPropagation(); updateCount();">
+                        <input type="checkbox" value="${safeId}" data-type="${safeType}" ${isFav ? 'disabled' : ''} aria-label="Select ${safeName} for cleanup" class="chat-checkbox w-5 h-5 sm:w-4 sm:h-4 rounded bg-slate-950 border-slate-700 text-cyan-500 focus:ring-0 focus:ring-offset-0 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed" onclick="event.stopPropagation(); updateCount();">
                         <div class="min-w-0">
                             <p class="text-xs sm:text-sm font-medium text-slate-200 truncate flex items-center gap-1.5">
                                 <i class="fa-solid ${icon} text-[11px] text-slate-400"></i>
-                                <span class="truncate">${chat.name}</span>
+                                <span class="truncate">${safeName}</span>
                                 ${isFav ? '<i class="fa-solid fa-star text-[9px] text-amber-400 flex-shrink-0" title="Protected favorite"></i>' : ''}
                             </p>
                             <p class="text-[11px] sm:text-xs text-slate-500 flex items-center gap-1.5 sm:gap-2 truncate">
-                                <span class="text-slate-400 font-mono truncate">${chat.username ? '@' + chat.username : 'ID: ' + chat.id}</span>
+                                <span class="text-slate-400 font-mono truncate">${safeUsername ? '@' + safeUsername : 'ID: ' + safeId}</span>
                                 <span>•</span>
-                                <span class="px-1.5 sm:px-2 py-0.5 rounded text-[9px] sm:text-[10px] flex-shrink-0 ${badgeClass}">${chat.type}</span>
+                                <span class="px-1.5 sm:px-2 py-0.5 rounded text-[9px] sm:text-[10px] flex-shrink-0 ${badgeClass}">${safeType}</span>
                                 ${isFav ? '<span class="px-1.5 sm:px-2 py-0.5 rounded text-[9px] sm:text-[10px] flex-shrink-0 bg-amber-950 text-amber-300 border border-amber-800/60">Protected</span>' : ''}
                             </p>
                         </div>
                     </div>
-                    <button type="button" data-fav-btn="${chat.id}" onclick="event.stopPropagation(); toggleFavorite('${chat.id}')" aria-pressed="${isFav}" aria-label="${isFav ? 'Remove' : 'Add'} ${safeName} ${isFav ? 'from' : 'to'} favorites" title="${isFav ? 'Unfavorite (unprotect)' : 'Favorite (protect from cleanup)'}" class="${FAV_BTN_BASE} ${isFav ? 'text-amber-400 bg-amber-950/50 border border-amber-500/40' : 'text-slate-600 hover:text-amber-400 hover:bg-slate-800 border border-transparent'}">
+                    <button type="button" data-fav-btn="${safeId}" onclick="event.stopPropagation(); toggleFavorite('${safeId}')" aria-pressed="${isFav}" aria-label="${isFav ? 'Remove' : 'Add'} ${safeName} ${isFav ? 'from' : 'to'} favorites" title="${isFav ? 'Unfavorite (unprotect)' : 'Favorite (protect from cleanup)'}" class="${FAV_BTN_BASE} ${isFav ? 'text-amber-400 bg-amber-950/50 border border-amber-500/40' : 'text-slate-600 hover:text-amber-400 hover:bg-slate-800 border border-transparent'}">
                         <i class="${isFav ? 'fa-solid' : 'fa-regular'} fa-star" aria-hidden="true"></i>
                     </button>
                 </div>
@@ -1290,7 +1705,7 @@ HTML_TEMPLATE = """
                         ${botCount > 0 ? `<li><b>${botCount}</b> Bots (Stop & Complete Wipe)</li>` : ''}
                     </ul>
                     ${favCount > 0 ? `<p class="text-xs text-amber-400 flex items-center gap-1.5 pt-1 border-t border-slate-800"><i class="fa-solid fa-star"></i> <b>${favCount}</b> favorites protected &mdash; excluded from cleanup.</p>` : ''}
-                    <p class="text-xs text-cyan-400 pt-1">Execution Delay: ${minD} - ${maxD} seconds per item.</p>
+                    <p class="text-xs text-cyan-400 pt-1">Execution Delay: ${escapeHtml(minD)} - ${escapeHtml(maxD)} seconds per item.</p>
                 </div>
             `;
 
@@ -1328,6 +1743,10 @@ HTML_TEMPLATE = """
                     document.getElementById('live-speed-val').innerText = minD + 's';
                     showProgress();
                     showToast(`Cleanup task started for ${checked.length} item(s)`, 'success');
+                } else if (isSessionExpired(res, json)) {
+                    showToast('Session expired - please log in again', 'error');
+                    btn.disabled = false;
+                    btn.innerHTML = '<i class="fa-solid fa-trash-can mr-2"></i> Leave & Clean Selected';
                 } else {
                     showToast(json.message || 'Failed to start task.', 'error');
                     btn.disabled = false;
@@ -1361,7 +1780,17 @@ HTML_TEMPLATE = """
             if (!currentTaskId) return;
             try {
                 const res = await fetch(`/api/task/status/${currentTaskId}`);
-                if (!res.ok) return;
+                if (!res.ok) {
+                    if (res.status === 401) {
+                        let err = null;
+                        try { err = await res.clone().json(); } catch (e) {}
+                        if (err && err.error === 'session_expired') {
+                            if (pollInterval) clearInterval(pollInterval);
+                            showToast('Session expired - please log in again', 'error');
+                        }
+                    }
+                    return;
+                }
                 const task = await res.json();
 
                 document.getElementById('stat-total').innerText = task.total || 0;
@@ -1378,7 +1807,16 @@ HTML_TEMPLATE = """
 
                 currentLogs = task.logs || [];
                 const logsBox = document.getElementById('logs-box');
-                logsBox.innerHTML = currentLogs.map(l => `<div>${l}</div>`).join('');
+                // Log lines carry Telegram-sourced entity names: build them with
+                // textContent so a hostile title can never inject markup.
+                logsBox.textContent = '';
+                const logFragment = document.createDocumentFragment();
+                currentLogs.forEach(line => {
+                    const row = document.createElement('div');
+                    row.textContent = line;
+                    logFragment.appendChild(row);
+                });
+                logsBox.appendChild(logFragment);
                 logsBox.scrollTop = logsBox.scrollHeight;
 
                 if (['completed', 'cancelled', 'error'].includes(task.status)) {
@@ -1461,22 +1899,31 @@ def sitemap_xml():
 
 
 @app.route("/api/auth/send_code", methods=["POST"])
+@json_errors
 def send_code():
-    data = request.json or {}
-    api_id = data.get("api_id")
-    api_hash = data.get("api_hash")
-    phone = data.get("phone")
-    bot_token = data.get("bot_token", "")
-    log_user_id = data.get("log_user_id", "")
-    min_delay = float(data.get("min_delay", 3))
-    max_delay = float(data.get("max_delay", 6))
+    data = request.get_json(silent=True) or {}
 
-    if not api_id or not api_hash or not phone:
-        return jsonify({"status": "error", "message": "Missing credentials"}), 400
+    # Shape/format first: garbage input must 400 before it can consume the
+    # per-IP cooldown, and before any number parsing can raise.
+    api_id = _get_int(data, "api_id", None, 1, 10 ** 9)
+    api_hash = _get_str(data, "api_hash", required=True, max_len=128)
+    phone = _get_str(data, "phone", required=True, max_len=32, pattern=r"\+?\d{7,15}")
+    bot_token = _get_str(data, "bot_token", max_len=128)
+    log_user_id = _get_str(data, "log_user_id", max_len=64)
 
-    clean_phone = phone.replace("+", "").replace(" ", "").strip()
+    # Per-IP cooldown (1 attempt / 60s), checked before the slower range
+    # validation so retry storms of a valid-shaped body get 429, not 400.
+    if _send_code_rate_limited():
+        return jsonify({"status": "error", "error": "too_many_requests",
+                        "message": "Too many login attempts. Please wait 60 seconds."}), 429
+
+    min_delay, max_delay = _get_delays(data, 3, 6)
+
+    digits = sanitize_phone_digits(phone)
+    if digits is None:
+        raise InputValidationError("phone must contain between 7 and 15 digits")
     session_id = str(uuid.uuid4())
-    session_file = os.path.join("tg_sessions", f"sess_{clean_phone}")
+    session_file = os.path.join("tg_sessions", f"sess_{digits}")
 
     async def _async_auth():
         for old_id, old_s in list(sessions_store.items()):
@@ -1485,6 +1932,7 @@ def send_code():
                     await old_s["client"].disconnect()
                 except Exception:
                     pass
+                old_s["connected"] = False
                 sessions_store.pop(old_id, None)
 
         client = None
@@ -1502,7 +1950,8 @@ def send_code():
         if await client.is_user_authorized():
             sessions_store[session_id] = {
                 "client": client, "phone": phone, "bot_token": bot_token,
-                "log_user_id": log_user_id, "min_delay": min_delay, "max_delay": max_delay
+                "log_user_id": log_user_id, "min_delay": min_delay, "max_delay": max_delay,
+                "connected": True, "authorized": True
             }
             return {"status": "logged_in", "session_id": session_id}
 
@@ -1514,7 +1963,9 @@ def send_code():
             "bot_token": bot_token,
             "log_user_id": log_user_id,
             "min_delay": min_delay,
-            "max_delay": max_delay
+            "max_delay": max_delay,
+            "connected": True,
+            "authorized": False
         }
         return {"status": "code_sent", "session_id": session_id}
 
@@ -1527,21 +1978,27 @@ def send_code():
 
 
 @app.route("/api/auth/verify", methods=["POST"])
+@json_errors
 def verify_code():
-    data = request.json or {}
-    session_id = data.get("session_id")
-    code = data.get("code")
-    password = data.get("password")
+    data = request.get_json(silent=True) or {}
+    session_id = _get_str(data, "session_id", required=True, max_len=64)
+    code = _get_str(data, "code", max_len=64)
+    password = _get_str(data, "password", max_len=1024)
+    if not code and not password:
+        raise InputValidationError("verification code or password is required")
 
     sess = sessions_store.get(session_id)
     if not sess:
-        return jsonify({"status": "error", "message": "Invalid or expired session. Please connect again."}), 400
+        return jsonify({"status": "error", "error": "session_not_found",
+                        "message": "Invalid or expired session. Please connect again."}), 400
 
-    client = sess["client"]
     phone = sess["phone"]
-    phone_code_hash = sess["phone_code_hash"]
+    phone_code_hash = sess.get("phone_code_hash")
+    if not password and not phone_code_hash:
+        return jsonify({"status": "error", "error": "session_not_found",
+                        "message": "Session is no longer awaiting a code. Please connect again."}), 400
 
-    async def _async_sign_in():
+    async def _async_sign_in(client):
         try:
             if password:
                 await client.sign_in(password=password)
@@ -1549,28 +2006,32 @@ def verify_code():
                 await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
         except errors.SessionPasswordNeededError:
             return {"status": "2fa_required"}
+        except (ConnectionError, OSError):
+            raise  # let run_with_connection_retry reconnect and retry once
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
+        sess["authorized"] = True
         return {"status": "success", "session_id": session_id}
 
-    future = asyncio.run_coroutine_threadsafe(_async_sign_in(), loop)
+    # The user is not authorized yet at this point, so skip that probe.
+    future = asyncio.run_coroutine_threadsafe(
+        run_with_connection_retry(sess, _async_sign_in, require_authorized=False), loop)
     try:
         res = future.result(timeout=25)
         return jsonify(res)
     except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+        return session_error_response(e)
 
 
 @app.route("/api/dialogs/<session_id>")
 def get_dialogs_list(session_id):
     sess = sessions_store.get(session_id)
     if not sess:
-        return jsonify({"status": "error", "message": "Session expired or not found. Please connect again."}), 404
+        return jsonify({"status": "error", "error": "session_not_found",
+                        "message": "Session expired or not found. Please connect again."}), 404
 
-    client = sess["client"]
-
-    async def _async_get_dialogs():
+    async def _async_get_dialogs(client):
         dialogs = await client.get_dialogs()
         chats = []
         cached_entities = {}
@@ -1587,46 +2048,56 @@ def get_dialogs_list(session_id):
         sess["cached_entities"] = cached_entities
         return {"status": "success", "chats": chats}
 
-    future = asyncio.run_coroutine_threadsafe(_async_get_dialogs(), loop)
+    future = asyncio.run_coroutine_threadsafe(run_with_connection_retry(sess, _async_get_dialogs), loop)
     try:
-        res = future.result(timeout=35)
+        res = future.result(timeout=40)
         return jsonify(res)
     except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+        return session_error_response(e)
 
 
 @app.route("/api/task/start", methods=["POST"])
+@json_errors
 def start_task():
-    data = request.json or {}
-    session_id = data.get("session_id")
-    target_ids = [str(x) for x in data.get("target_ids", [])]
-    exclude_ids = sorted({str(x) for x in (data.get("exclude_ids") or [])})
-    min_delay = float(data.get("min_delay", 3.0))
-    max_delay = float(data.get("max_delay", 6.0))
+    data = request.get_json(silent=True) or {}
+    session_id = _get_str(data, "session_id", required=True, max_len=64)
+    target_ids = _get_id_list(data, "target_ids")
+    exclude_ids = _get_id_list(data, "exclude_ids")
+    min_delay, max_delay = _get_delays(data, 3.0, 6.0)
 
     sess = sessions_store.get(session_id)
     if not sess:
-        return jsonify({"status": "error", "message": "Session expired. Please reconnect."}), 400
+        return jsonify({"status": "error", "error": "session_expired",
+                        "message": "Session expired. Please reconnect."}), 401
 
-    client = sess["client"]
     cached_entities = sess.get("cached_entities", {})
     selected_entities = [cached_entities[cid] for cid in target_ids if cid in cached_entities]
 
     if not selected_entities:
-        return jsonify({"status": "error", "message": "No valid chats or bots selected"}), 400
+        return jsonify({"status": "error", "error": "no_targets",
+                        "message": "No valid chats or bots selected"}), 400
+
+    # Revive the stored client before committing to a task: a dead session
+    # must fail fast with clean JSON instead of an always-error task.
+    future = asyncio.run_coroutine_threadsafe(
+        run_with_connection_retry(sess, _noop_operation), loop)
+    try:
+        future.result(timeout=25)
+    except Exception as e:
+        return session_error_response(e)
 
     task_id = str(uuid.uuid4())
     tasks_store[task_id] = {
         "status": "starting", "total": len(selected_entities), "current_index": 0, "current_name": "",
         "min_delay": min_delay, "max_delay": max_delay, "current_delay": min_delay,
-        "left": 0, "failed": 0, "protected": 0, "exclude_ids": exclude_ids,
+        "left": 0, "failed": 0, "protected": 0, "exclude_ids": sorted(set(exclude_ids)),
         "logs": [], "cancelled": False
     }
 
     asyncio.run_coroutine_threadsafe(
         execute_leaving_process(
-            task_id, client, selected_entities,
-            sess["bot_token"], sess["log_user_id"]
+            task_id, sess["client"], selected_entities,
+            sess.get("bot_token", ""), sess.get("log_user_id", ""), session_entry=sess
         ),
         loop
     )
@@ -1635,12 +2106,14 @@ def start_task():
 
 
 @app.route("/api/task/speed/<task_id>", methods=["POST"])
+@json_errors
 def change_speed(task_id):
-    data = request.json or {}
+    data = request.get_json(silent=True) or {}
+    min_delay, max_delay = _get_delays(data, 2.0, 5.0)
     task = tasks_store.get(task_id)
     if task:
-        task["min_delay"] = float(data.get("min_delay", 2.0))
-        task["max_delay"] = float(data.get("max_delay", 5.0))
+        task["min_delay"] = min_delay
+        task["max_delay"] = max_delay
         return jsonify({"status": "updated"})
     return jsonify({"status": "not_found"}), 404
 

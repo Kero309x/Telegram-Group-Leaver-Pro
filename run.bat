@@ -3,7 +3,7 @@ title Telegram Group Leaver Pro - By Kero309x
 color 0b
 
 echo ===================================================
-echo     Telegram Group ^& Channel Leaver Pro (v2.5)
+echo     Telegram Group ^& Channel Leaver Pro (v1.0)
 echo     Engineered by @Kero309x (GitHub)
 echo ===================================================
 echo.
