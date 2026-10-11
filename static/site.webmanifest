@@ -1,0 +1,12 @@
+{
+  "name": "TG Cleaner Pro - Telegram Group, Channel & Bot Cleaner",
+  "short_name": "TG Cleaner",
+  "description": "Batch-leave Telegram channels and supergroups, block and wipe bots - real MTProto execution with speed control and live logs.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#020617",
+  "theme_color": "#020617",
+  "icons": [
+    { "src": "/static/favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}

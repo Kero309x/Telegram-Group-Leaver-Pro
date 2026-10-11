@@ -67,6 +67,7 @@
 - 📊 **Real-time Telemetry & Log Export**: Dynamic progress bar, live status counters (Cleaned, Skipped/Failed, Total), and single-click `.txt` log exporter.
 - 🔔 **Private Bot Alerts**: Integrated Telegram Bot webhook to stream live execution notifications directly to your private chat.
 - 🔒 **Zero Telemetry / 100% Private**: Your API ID, Hash, and sessions are kept strictly on your local machine (`localhost`).
+- 🔍 **SEO-Ready & Professional**: Semantic meta tags, Open Graph / Twitter cards, JSON-LD structured data, `robots.txt`, `sitemap.xml`, SVG favicon, PWA manifest, and hardened security headers.
 
 ---
 
@@ -145,6 +146,7 @@ cd Telegram-Group-Leaver-Pro
 * ⚡ **تحكم فوري بالسرعة**: 4 أوضاع سرعة مسبقة + سلايدر مباشر لتغيير السرعة أثناء عمل البرنامج بدون إيقافه.
 * 💾 **حفظ تلقائي للبيانات**: حفظ مفاتيح الـ API ورقم الهاتف محلياً داخل المتصفح لعدم تكرار كتابتها.
 * 📊 **تصدير السجلات**: إمكانية تصدير التقرير النهائي بضغطة زر كملف نصي (`.txt`).
+* 🔍 **SEO احترافي**: وسوم meta كاملة، بطاقات Open Graph و Twitter، بيانات منظمة JSON-LD، `robots.txt`، `sitemap.xml`، أيقونة SVG، وmanifest لتطبيق ويب (PWA).
 
 </div>
 

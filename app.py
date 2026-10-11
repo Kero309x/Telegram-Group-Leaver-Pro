@@ -6,7 +6,7 @@ import time
 import uuid
 from typing import Dict, Any, List
 
-from flask import Flask, render_template_string, request, jsonify
+from flask import Flask, render_template_string, request, jsonify, Response
 import aiohttp
 from telethon import TelegramClient, errors, functions, types
 from telethon.tl.types import Channel, Chat, User
@@ -17,6 +17,12 @@ __version__ = "1.0"
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
+
+# Public URL used for SEO tags (canonical, Open Graph, sitemap).
+# Set SITE_URL env var when deploying to a real domain.
+SITE_URL = os.environ.get(
+    "SITE_URL", "https://github.com/Kero309x/Telegram-Group-Leaver-Pro"
+).rstrip("/")
 
 # Global store
 sessions_store: Dict[str, Dict[str, Any]] = {}
@@ -33,6 +39,15 @@ def run_background_loop(loop_to_run):
     loop_to_run.run_forever()
 
 threading.Thread(target=run_background_loop, args=(loop,), daemon=True).start()
+
+
+@app.after_request
+def set_security_headers(response):
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    return response
 
 
 def get_local_ip() -> str:
@@ -278,9 +293,32 @@ HTML_TEMPLATE = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <meta name="theme-color" content="#020617">
-    <title>TG Cleaner Pro v1.0 - By Kero309x</title>
+    <title>TG Cleaner Pro - Bulk Leave Telegram Groups, Channels &amp; Bots</title>
+    <meta name="description" content="Clean your Telegram account in one click: batch-leave unwanted channels and supergroups, block and wipe bots, with real MTProto API, speed control and live logs.">
+    <meta name="keywords" content="telegram cleaner, leave telegram groups, bulk leave telegram channels, delete telegram bots, telegram cleanup tool, MTProto, TG Cleaner Pro">
+    <meta name="author" content="Kero309x">
+    <meta name="robots" content="index, follow, max-image-preview:large">
+    <meta name="application-name" content="TG Cleaner Pro">
+    <link rel="canonical" href="{{ site_url }}/">
+
+    <meta property="og:type" content="website">
+    <meta property="og:site_name" content="TG Cleaner Pro">
+    <meta property="og:title" content="TG Cleaner Pro - Bulk Leave Telegram Groups, Channels &amp; Bots">
+    <meta property="og:description" content="Batch-leave Telegram channels and supergroups, block and wipe bots - real MTProto execution with speed control and live logs.">
+    <meta property="og:url" content="{{ site_url }}/">
+    <meta property="og:image" content="https://opengraph.githubassets.com/1/Kero309x/Telegram-Group-Leaver-Pro">
+    <meta property="og:locale" content="en_US">
+
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="TG Cleaner Pro - Bulk Leave Telegram Groups, Channels &amp; Bots">
+    <meta name="twitter:description" content="Batch-leave Telegram channels and supergroups, block and wipe bots - real MTProto execution with speed control and live logs.">
+    <meta name="twitter:image" content="https://opengraph.githubassets.com/1/Kero309x/Telegram-Group-Leaver-Pro">
+
+    <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+    <link rel="manifest" href="/static/site.webmanifest">
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link rel="preconnect" href="https://cdnjs.cloudflare.com">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -292,6 +330,22 @@ HTML_TEMPLATE = """
         ::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 4px; }
         ::-webkit-scrollbar-thumb:hover { background: #334155; }
     </style>
+    <script type="application/ld+json">
+    {
+        "@context": "https://schema.org",
+        "@type": "SoftwareApplication",
+        "name": "TG Cleaner Pro",
+        "description": "Batch-leave Telegram channels and supergroups, block and wipe bots - real MTProto execution with speed control and live logs.",
+        "url": "{{ site_url }}/",
+        "image": "https://opengraph.githubassets.com/1/Kero309x/Telegram-Group-Leaver-Pro",
+        "author": { "@type": "Person", "name": "Kero309x", "url": "https://github.com/Kero309x" },
+        "license": "https://opensource.org/licenses/MIT",
+        "applicationCategory": "UtilitiesApplication",
+        "operatingSystem": "Windows, Linux, macOS, Android (Termux)",
+        "softwareVersion": "1.0",
+        "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" }
+    }
+    </script>
 </head>
 <body class="bg-slate-950 text-slate-100 min-h-screen py-4 sm:py-8 px-3 sm:px-6 flex flex-col justify-between selection:bg-cyan-500 selection:text-slate-950">
     <div class="max-w-4xl w-full mx-auto space-y-4 sm:space-y-6">
@@ -1090,7 +1144,30 @@ HTML_TEMPLATE = """
 
 @app.route("/")
 def index():
-    return render_template_string(HTML_TEMPLATE, local_ip=get_local_ip())
+    return render_template_string(HTML_TEMPLATE, local_ip=get_local_ip(), site_url=SITE_URL)
+
+
+@app.route("/robots.txt")
+def robots_txt():
+    body = (
+        "User-agent: *\n"
+        "Allow: /\n"
+        "Disallow: /api/\n"
+        f"Sitemap: {SITE_URL}/sitemap.xml\n"
+    )
+    return Response(body, mimetype="text/plain")
+
+
+@app.route("/sitemap.xml")
+def sitemap_xml():
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+        f"  <url><loc>{SITE_URL}/</loc><changefreq>weekly</changefreq>"
+        "<priority>1.0</priority></url>\n"
+        "</urlset>"
+    )
+    return Response(xml, mimetype="application/xml")
 
 
 @app.route("/api/auth/send_code", methods=["POST"])

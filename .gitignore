@@ -5,6 +5,7 @@ __pycache__/
 *.so
 .env
 venv/
+.venv/
 env/
 ENV/
 
@@ -14,6 +15,7 @@ ENV/
 tg_sessions/
 logs_export/
 *.log
+server.err
 
 # IDE & OS
 .vscode/
