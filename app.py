@@ -11,6 +11,7 @@ import uuid
 from typing import Dict, Any, List
 
 from flask import Flask, render_template_string, request, jsonify, Response
+from werkzeug.exceptions import HTTPException, InternalServerError
 import aiohttp
 from telethon import TelegramClient, errors, functions, types
 from telethon.tl.types import Channel, Chat, User
@@ -27,6 +28,8 @@ app.secret_key = os.urandom(24)
 SITE_URL = os.environ.get(
     "SITE_URL", "https://github.com/Kero309x/Telegram-Group-Leaver-Pro"
 ).rstrip("/")
+# The GitHub repo has no sitemap.xml, so robots.txt only advertises one on custom domains.
+SITE_URL_IS_CUSTOM = "SITE_URL" in os.environ
 
 # Global store
 sessions_store: Dict[str, Dict[str, Any]] = {}
@@ -194,33 +197,53 @@ def require_dashboard_pin():
 
 
 # ---------------------------------------------------------------------------
-# send_code abuse protection: in-memory per-IP cooldown (1 attempt / 60s).
+# send_code / verify abuse protection: in-memory per-IP cooldowns
+# (1 attempt / 60s for send_code, 1 attempt / 30s for verify).
 # ---------------------------------------------------------------------------
 
 SEND_CODE_COOLDOWN_SECONDS = 60
+VERIFY_CODE_COOLDOWN_SECONDS = 30
 _send_code_last_attempt: Dict[str, float] = {}
+_verify_last_attempt: Dict[str, float] = {}
+
+_TRUTHY_ENV_VALUES = ("1", "true", "yes", "on")
 
 
 def _client_ip() -> str:
-    """Best-effort client IP (honours X-Forwarded-For when behind a proxy)."""
-    forwarded = request.headers.get("X-Forwarded-For", "")
+    """Client IP. X-Forwarded-For is only trusted when TRUST_PROXY is set."""
+    forwarded = ""
+    trust_proxy = os.environ.get("TRUST_PROXY", "").strip().lower()
+    if trust_proxy in _TRUTHY_ENV_VALUES:
+        forwarded = request.headers.get("X-Forwarded-For", "")
     if forwarded:
         return forwarded.split(",")[0].strip()[:64]
     return (request.remote_addr or "unknown")[:64]
 
 
-def _send_code_rate_limited() -> bool:
-    """Returns True when this IP must wait; records the attempt otherwise."""
+def _cooldown_remaining(registry: Dict[str, float], window: int) -> int:
+    """Seconds this IP must still wait; records the attempt when the window is free.
+
+    Returns 0 (and records the attempt) when the request may proceed, so callers
+    must only invoke this after every other validation has passed.
+    """
     now = time.time()
     ip = _client_ip()
-    for key, ts in list(_send_code_last_attempt.items()):
-        if now - ts >= SEND_CODE_COOLDOWN_SECONDS:
-            _send_code_last_attempt.pop(key, None)
-    last = _send_code_last_attempt.get(ip)
-    if last is not None and (now - last) < SEND_CODE_COOLDOWN_SECONDS:
-        return True
-    _send_code_last_attempt[ip] = now
-    return False
+    for key, ts in list(registry.items()):
+        if now - ts >= window:
+            registry.pop(key, None)
+    last = registry.get(ip)
+    if last is not None and (now - last) < window:
+        return int(math.ceil(window - (now - last)))
+    registry[ip] = now
+    return 0
+
+
+def _too_many_requests(remaining: int, message: str):
+    """429 JSON reply carrying a Retry-After header for well-behaved clients."""
+    response = jsonify({"status": "error", "error": "too_many_requests",
+                        "message": message})
+    response.headers["Retry-After"] = str(max(remaining, 1))
+    return response, 429
 
 
 
@@ -231,6 +254,61 @@ def set_security_headers(response):
     response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
     response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
     return response
+
+
+# ---------------------------------------------------------------------------
+# Error handlers: /api/* always answers with JSON (the frontend does
+# res.json() unconditionally), everything else keeps Flask's default HTML page.
+# ---------------------------------------------------------------------------
+
+_API_ERROR_NAMES = {
+    404: ("not_found", "Endpoint not found."),
+    405: ("method_not_allowed", "Method not allowed for this endpoint."),
+    500: ("internal_error", "Internal server error."),
+}
+
+
+def _wants_json_error() -> bool:
+    return request.path.startswith("/api/")
+
+
+@app.errorhandler(404)
+def handle_not_found(err):
+    if _wants_json_error():
+        name, message = _API_ERROR_NAMES[404]
+        return jsonify({"error": name, "message": message}), 404
+    return err.get_response()
+
+
+@app.errorhandler(405)
+def handle_method_not_allowed(err):
+    if _wants_json_error():
+        name, message = _API_ERROR_NAMES[405]
+        return jsonify({"error": name, "message": message}), 405
+    return err.get_response()
+
+
+@app.errorhandler(500)
+def handle_internal_error(err):
+    if _wants_json_error():
+        name, message = _API_ERROR_NAMES[500]
+        return jsonify({"error": name, "message": message}), 500
+    return err.get_response()
+
+
+@app.errorhandler(Exception)
+def handle_unexpected_error(err):
+    """Last resort so no /api/* path can ever surface an HTML error page."""
+    if isinstance(err, HTTPException):
+        if _wants_json_error():
+            name, message = _API_ERROR_NAMES.get(
+                err.code, (err.name.lower().replace(" ", "_"), err.description or err.name))
+            return jsonify({"error": name, "message": message}), err.code
+        return err.get_response()
+    app.logger.exception("Unhandled exception on %s", request.path)
+    if _wants_json_error():
+        return jsonify({"error": "internal_error", "message": "Internal server error."}), 500
+    return InternalServerError().get_response()
 
 
 def get_local_ip() -> str:
@@ -380,37 +458,67 @@ def session_error_response(exc):
     if isinstance(exc, SessionExpiredError):
         return jsonify({"status": "error", "error": "session_expired",
                         "message": "Session expired. Please log in again."}), 401
-    if isinstance(exc, (ConnectionError, OSError)):
-        return jsonify({"status": "error", "error": "connection_failed",
-                        "message": "Could not reach Telegram just now. Please try again."}), 503
+    # TimeoutError must be checked before (ConnectionError, OSError): on
+    # Python 3.10+ TimeoutError is an OSError subclass, so the order matters.
     if isinstance(exc, TimeoutError):
         return jsonify({"status": "error", "error": "timeout",
                         "message": "The operation timed out. Please try again."}), 504
+    if isinstance(exc, (ConnectionError, OSError)):
+        return jsonify({"status": "error", "error": "connection_failed",
+                        "message": "Could not reach Telegram just now. Please try again."}), 503
     return jsonify({"status": "error", "error": "internal_error",
                     "message": str(exc)}), 500
 
 
 
-async def execute_leave_or_delete(client: TelegramClient, entity, max_retries=3) -> tuple:
+# A single item never sleeps longer than this in FloodWait backoffs in total;
+# beyond it the task is aborted so a repeated-flood loop cannot hang forever.
+FLOOD_WAIT_BUDGET_SECONDS = 600
+
+
+def _abort_task_for_flood(task, message: str) -> None:
+    """Marks the task as errored and records the reason in its log."""
+    if task is None:
+        return
+    task["status"] = "error"
+    task["error_message"] = message
+    task["logs"].append(f"[{time.strftime('%H:%M:%S')}] {message}")
+
+
+async def execute_leave_or_delete(client: TelegramClient, entity, max_retries=3, task=None) -> tuple:
     """
     Completely and permanently leaves channels/groups or stops & wipes bots from the chat list.
-    Returns (success: bool, status_msg: str)
+
+    Returns (success: bool, status_msg: str, warnings: list[str]).
+    Success reflects the actual removal step: best-effort cleanup steps that fail
+    only append "[!] <step> failed: <err>" warnings, while a failed removal step
+    surfaces as success=False through the retry/classification handlers below.
     """
     is_bot = isinstance(entity, User) and getattr(entity, "bot", False)
+    warnings = []
+    step = "resolve entity"
+    attempt = 0
+    flood_slept = 0
 
-    for attempt in range(1, max_retries + 1):
+    while attempt < max_retries:
+        attempt += 1
+        step = "resolve entity"
         try:
             # 1. Resolve InputPeer / InputEntity properly
             input_entity = await client.get_input_entity(entity)
 
             if is_bot:
-                # A. Stop / Block the Bot (Official Stop Bot)
+                # A. Stop / Block the Bot (Official Stop Bot) - best effort
+                step = "block bot"
                 try:
                     await client(functions.contacts.BlockRequest(id=input_entity))
-                except Exception:
-                    pass
+                except errors.FloodWaitError:
+                    raise
+                except Exception as exc:
+                    warnings.append(f"[!] Block failed: {exc}")
 
                 # B. Permanently wipe entire chat history in both directions (Revoke + Clear)
+                step = "wipe history"
                 try:
                     await client(functions.messages.DeleteHistoryRequest(
                         peer=input_entity,
@@ -418,65 +526,88 @@ async def execute_leave_or_delete(client: TelegramClient, entity, max_retries=3)
                         just_clear=False,
                         revoke=True
                     ))
-                except Exception:
-                    pass
+                except errors.FloodWaitError:
+                    raise
+                except Exception as exc:
+                    warnings.append(f"[!] History wipe failed: {exc}")
 
-                # C. Remove dialog completely from the chat list
-                try:
-                    await client.delete_dialog(input_entity, revoke=True)
-                except Exception:
-                    pass
-
-                return True, "Bot Stopped & Completely Wiped (100% Cleared)"
+                # C. Removal step: the dialog must actually disappear from the
+                # chat list, otherwise the item counts as failed.
+                step = "remove dialog"
+                await client.delete_dialog(input_entity, revoke=True)
+                return True, "Bot Stopped & Completely Wiped (100% Cleared)", warnings
 
             elif isinstance(entity, Channel):
+                step = "leave channel"
                 await client(functions.channels.LeaveChannelRequest(input_entity))
+                step = "remove dialog"
                 try:
                     await client.delete_dialog(input_entity, revoke=True)
-                except Exception:
-                    pass
-                return True, "Left & Removed Channel"
+                except errors.FloodWaitError:
+                    raise
+                except Exception as exc:
+                    warnings.append(f"[!] Dialog removal failed: {exc}")
+                return True, "Left & Removed Channel", warnings
 
             elif isinstance(entity, Chat):
-                try:
-                    await client(functions.messages.DeleteChatUserRequest(
-                        chat_id=entity.id,
-                        user_id=types.InputUserSelf(),
-                        revoke_history=True
-                    ))
-                except Exception:
-                    pass
+                # Removal step for basic groups: leaving must succeed.
+                step = "leave group"
+                await client(functions.messages.DeleteChatUserRequest(
+                    chat_id=entity.id,
+                    user_id=types.InputUserSelf(),
+                    revoke_history=True
+                ))
+                step = "remove dialog"
                 try:
                     await client.delete_dialog(input_entity, revoke=True)
-                except Exception:
-                    pass
-                return True, "Left & Removed Group"
+                except errors.FloodWaitError:
+                    raise
+                except Exception as exc:
+                    warnings.append(f"[!] Dialog removal failed: {exc}")
+                return True, "Left & Removed Group", warnings
 
             else:
+                step = "remove dialog"
                 await client.delete_dialog(input_entity, revoke=True)
-                return True, "Cleaned Dialog"
+                return True, "Cleaned Dialog", warnings
 
         except errors.FloodWaitError as e:
-            await asyncio.sleep(e.seconds)
+            wait = int(getattr(e, "seconds", 0) or 0)
+            stamp = time.strftime("%H:%M:%S")
+            if wait > 300:
+                _abort_task_for_flood(task, "FloodWait too long (>300s) — aborted for safety")
+                return False, "FloodWait too long (>300s) — aborted for safety", warnings
+            if task is not None:
+                task["current_delay"] = wait
+                task["logs"].append(f"[{stamp}] FloodWait: sleeping {wait}s (rate limit)")
+            flood_slept += wait
+            if flood_slept > FLOOD_WAIT_BUDGET_SECONDS:
+                message = f"FloodWait budget exhausted (>{FLOOD_WAIT_BUDGET_SECONDS}s) — aborted for safety"
+                _abort_task_for_flood(task, message)
+                return False, message, warnings
+            await asyncio.sleep(wait)
+            # A rate-limit wait must not consume a retry attempt.
+            attempt -= 1
             continue
 
         except (errors.ChatAdminRequiredError, errors.rpcerrorlist.ChatAdminRequiredError):
-            return False, "Skipped (Admin/Owner Rights Required)"
+            return False, "Skipped (Admin/Owner Rights Required)", warnings
 
         except (errors.UserNotParticipantError, errors.rpcerrorlist.UserNotParticipantError):
-            return True, "Already Left/Cleaned"
+            return True, "Already Left/Cleaned", warnings
 
         except errors.rpcerrorlist.ChatForbiddenError:
-            return True, "Forbidden/Deleted"
+            return True, "Forbidden/Deleted", warnings
 
         except Exception as e:
             err_str = str(e)
+            warnings.append(f"[!] {step} failed: {err_str[:120]}")
             if attempt < max_retries:
                 await asyncio.sleep(1.5 ** attempt)
             else:
-                return False, f"Error: {err_str[:45]}"
+                return False, f"Error: {err_str[:45]}", warnings
 
-    return False, "Max retries reached"
+    return False, "Max retries reached", warnings
 
 
 async def execute_leaving_process(task_id: str, client: TelegramClient, targets: List[Any], bot_token: str, log_user_id: str, session_entry=None):
@@ -530,7 +661,7 @@ async def execute_leaving_process(task_id: str, client: TelegramClient, targets:
                 task["current_delay"] = round(delay, 1)
                 await asyncio.sleep(delay)
 
-            success, detail = await execute_leave_or_delete(client, entity)
+            success, detail, item_warnings = await execute_leave_or_delete(client, entity, task=task)
 
             timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
             time_short = time.strftime("%H:%M:%S")
@@ -544,6 +675,9 @@ async def execute_leaving_process(task_id: str, client: TelegramClient, targets:
                 task["failed"] = failed_count
                 task["logs"].append(f"[{time_short}] [{idx}/{total}] [✗] {detail}: {name}")
 
+            for warning in item_warnings:
+                task["logs"].append(f"[{time_short}] [{idx}/{total}] {warning}")
+
             log_msg = (
                 f"<b>TG Cleaner Log</b>\n"
                 f"<b>Target:</b> {name} (<i>{etype}</i>)\n"
@@ -553,7 +687,12 @@ async def execute_leaving_process(task_id: str, client: TelegramClient, targets:
             )
             asyncio.create_task(send_log_to_bot(bot_token, log_user_id, log_msg))
 
-        if task["status"] != "cancelled":
+            if task.get("status") == "error":
+                # The item aborted the whole task (e.g. oversized FloodWait).
+                task["logs"].append(f"[{time.strftime('%H:%M:%S')}] Task aborted.")
+                break
+
+        if task["status"] not in ("cancelled", "error"):
             task["status"] = "completed"
             final_report = (
                 f"<b>Telegram Cleaning Complete</b>\n"
@@ -779,11 +918,11 @@ HTML_TEMPLATE = """
                 <div class="grid grid-cols-2 gap-3 pt-1">
                 <div>
                     <label for="min_delay" class="block text-[11px] text-slate-400 mb-0.5">Min Delay (sec)</label>
-                    <input id="min_delay" oninput="saveInputs(); updateSpeedLabel();" type="number" step="0.5" value="3" class="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-cyan-500">
+                    <input id="min_delay" oninput="syncDelayInputs(this.value, 'min');" type="number" step="0.5" value="3" class="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-cyan-500">
                 </div>
                 <div>
                     <label for="max_delay" class="block text-[11px] text-slate-400 mb-0.5">Max Delay (sec)</label>
-                    <input id="max_delay" oninput="saveInputs(); updateSpeedLabel();" type="number" step="0.5" value="6" class="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-cyan-500">
+                    <input id="max_delay" oninput="syncDelayInputs(this.value, 'max');" type="number" step="0.5" value="6" class="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-cyan-500">
                 </div>
                 </div>
             </div>
@@ -842,6 +981,7 @@ HTML_TEMPLATE = """
                         <option value="fast">🚀 Fast (1-3s)</option>
                         <option value="safe" selected>🛡️ Safe (3-6s) - Recommended</option>
                         <option value="stealth">🐢 Stealth (8-15s)</option>
+                        <option value="custom">Custom</option>
                     </select>
                 </div>
                 <div class="flex items-center justify-end gap-2">
@@ -920,7 +1060,7 @@ HTML_TEMPLATE = """
                     <div class="flex items-center gap-1.5 bg-slate-950 px-2.5 py-1.5 rounded-lg border border-slate-800 text-xs">
                         <i class="fa-solid fa-gauge text-cyan-400 text-[10px]"></i>
                         <span class="text-slate-400">Speed:</span>
-                        <input id="live-speed-slider" oninput="changeLiveSpeed(this.value)" type="range" min="0" max="10" step="0.5" value="3" class="w-14 sm:w-16 accent-cyan-500 cursor-pointer">
+                        <input id="live-speed-slider" oninput="changeLiveSpeed(this.value)" type="range" min="0" max="15" step="0.5" value="3" class="w-14 sm:w-16 accent-cyan-500 cursor-pointer">
                         <span id="live-speed-val" class="font-mono text-cyan-400 w-6 text-right">3s</span>
                     </div>
                     <button onclick="exportLogs()" title="Export logs as TXT" class="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold rounded-lg transition flex items-center gap-1">
@@ -1038,7 +1178,9 @@ HTML_TEMPLATE = """
     <script>
         let currentSessionId = localStorage.getItem('tg_session_id') || null;
         let currentTaskId = null;
+        let currentTaskStatus = null;
         let pollInterval = null;
+        let pollFailures = 0;
         let loadedChats = [];
         let currentLogs = [];
         let modalConfirmCallback = null;
@@ -1067,6 +1209,28 @@ HTML_TEMPLATE = """
             error: { bar: 'border-l-rose-500', icon: 'fa-circle-exclamation', iconClass: 'text-rose-400' },
             info: { bar: 'border-l-cyan-500', icon: 'fa-circle-info', iconClass: 'text-cyan-400' }
         };
+
+        const BADGE_STYLES = {
+            idle: ["hidden sm:inline-block px-3 py-1.5 text-xs font-semibold rounded-full bg-slate-800 text-slate-400 border border-slate-700/50", "px-2.5 py-1 text-[11px] font-semibold rounded-full bg-slate-800 text-slate-400 border border-slate-700/50"],
+            running: ["hidden sm:inline-block px-3 py-1.5 text-xs font-semibold rounded-full bg-cyan-900/50 text-cyan-400 border border-cyan-700/50", "px-2.5 py-1 text-[11px] font-semibold rounded-full bg-cyan-900/50 text-cyan-400 border border-cyan-700/50"],
+            error: ["hidden sm:inline-block px-3 py-1.5 text-xs font-semibold rounded-full bg-rose-900/50 text-rose-400 border border-rose-700/50", "px-2.5 py-1 text-[11px] sm:px-3 sm:py-1.5 sm:text-xs font-semibold rounded-full bg-rose-900/50 text-rose-400 border border-rose-700/50"],
+            success: ["hidden sm:inline-block px-3 py-1.5 text-xs font-semibold rounded-full bg-emerald-900/50 text-emerald-400 border border-emerald-700/50", "px-2.5 py-1 text-[11px] sm:px-3 sm:py-1.5 sm:text-xs font-semibold rounded-full bg-emerald-900/50 text-emerald-400 border border-emerald-700/50"]
+        };
+
+        function setBadge(text, kind) {
+            const style = BADGE_STYLES[kind] || BADGE_STYLES.idle;
+            const b = document.getElementById('badge');
+            const bm = document.getElementById('badge-mobile');
+            if (b) { b.className = style[0]; b.innerText = text; }
+            if (bm) { bm.className = style[1]; bm.innerText = text; }
+        }
+
+        function stopPolling() {
+            if (pollInterval) {
+                clearInterval(pollInterval);
+                pollInterval = null;
+            }
+        }
 
         function escapeHtml(value) {
             const entities = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
@@ -1146,6 +1310,30 @@ HTML_TEMPLATE = """
 
         function isSessionExpired(res, payload) {
             return !!(res && res.status === 401 && payload && payload.error === 'session_expired');
+        }
+
+        // Exit path for session_expired: tear the session down and reset the
+        // step wizard to step 1 instead of leaving a dead-end Retry button.
+        function handleSessionExpired() {
+            stopPolling();
+            currentTaskId = null;
+            currentTaskStatus = null;
+            const staleSession = currentSessionId || localStorage.getItem('tg_session_id');
+            localStorage.removeItem('tg_session_id');
+            currentSessionId = null;
+            if (staleSession) {
+                fetch('/api/auth/logout', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ session_id: staleSession })
+                }).catch(() => {});
+            }
+            document.getElementById('step-verify').classList.add('hidden');
+            document.getElementById('step-select').classList.add('hidden');
+            document.getElementById('step-progress').classList.add('hidden');
+            document.getElementById('step-auth').classList.remove('hidden');
+            setBadge('Idle', 'idle');
+            showToast('Session expired — please log in again', 'error');
         }
 
         function showToast(message, type = 'info') {
@@ -1372,23 +1560,72 @@ HTML_TEMPLATE = """
             document.getElementById('custom-modal').classList.add('hidden');
         }
 
+        const SPEED_BTN_IDLE = "speed-btn py-2.5 px-3 rounded-lg border border-slate-800 bg-slate-900 text-xs font-medium hover:border-slate-700 transition";
+        const SPEED_BTN_ACTIVE = "speed-btn py-2.5 px-3 rounded-lg border border-cyan-500 bg-cyan-950/40 text-cyan-300 text-xs font-medium transition";
+        const LIVE_SLIDER_MAX = 15;
+
+        function matchSpeedPreset(min, max) {
+            const minN = parseFloat(min);
+            const maxN = parseFloat(max);
+            if (!isFinite(minN) || !isFinite(maxN)) return null;
+            const found = Object.keys(SPEED_PRESETS).find(
+                key => minN === SPEED_PRESETS[key].min && maxN === SPEED_PRESETS[key].max);
+            return found || null;
+        }
+
+        function clampLiveSpeed(val) {
+            const n = parseFloat(val);
+            if (!isFinite(n)) return null;
+            return Math.min(Math.max(n, 0), LIVE_SLIDER_MAX);
+        }
+
+        function setLiveSpeedUI(val) {
+            const clamped = clampLiveSpeed(val);
+            if (clamped === null) return;
+            const slider = document.getElementById('live-speed-slider');
+            if (slider) slider.value = clamped;
+            const label = document.getElementById('live-speed-val');
+            if (label) label.innerText = clamped + 's';
+        }
+
+        // Single source of truth for the whole speed UI: mirrors the step-1
+        // delays into step 3, then refreshes preset select, button highlight,
+        // label and the live slider from those values.
+        function syncSpeedUI() {
+            const minEl = document.getElementById('min_delay');
+            const maxEl = document.getElementById('max_delay');
+            if (!minEl || !maxEl) return;
+            const min = minEl.value;
+            const max = maxEl.value;
+
+            const s3min = document.getElementById('step3-min-delay');
+            const s3max = document.getElementById('step3-max-delay');
+            if (s3min) s3min.value = min;
+            if (s3max) s3max.value = max;
+
+            const preset = matchSpeedPreset(min, max);
+            document.querySelectorAll('.speed-btn').forEach(b => { b.className = SPEED_BTN_IDLE; });
+            if (preset) {
+                const activeBtn = document.getElementById('speed-btn-' + preset);
+                if (activeBtn) activeBtn.className = SPEED_BTN_ACTIVE;
+            }
+
+            const label = document.getElementById('speed-label');
+            if (label) label.innerText = preset ? SPEED_PRESETS[preset].label : `Custom (${min}-${max}s)`;
+
+            const select = document.getElementById('select-speed-preset');
+            if (select) select.value = preset || 'custom';
+
+            setLiveSpeedUI(min);
+        }
+
         function setSpeedMode(mode) {
             const p = SPEED_PRESETS[mode];
             if (!p) return;
             document.getElementById('min_delay').value = p.min;
             document.getElementById('max_delay').value = p.max;
-            document.getElementById('step3-min-delay').value = p.min;
-            document.getElementById('step3-max-delay').value = p.max;
-
-            document.querySelectorAll('.speed-btn').forEach(b => {
-                b.className = "speed-btn py-2.5 px-3 rounded-lg border border-slate-800 bg-slate-900 text-xs font-medium hover:border-slate-700 transition";
-            });
-            const activeBtn = document.getElementById('speed-btn-' + mode);
-            if (activeBtn) {
-                activeBtn.className = "speed-btn py-2.5 px-3 rounded-lg border border-cyan-500 bg-cyan-950/40 text-cyan-300 text-xs font-medium transition";
-            }
-            document.getElementById('speed-label').innerText = p.label;
             saveInputs();
+            syncSpeedUI();
         }
 
         function applySpeedPreset(mode) {
@@ -1396,31 +1633,22 @@ HTML_TEMPLATE = """
         }
 
         function syncDelayInputs(val, type) {
-            if (type === 'min') {
-                document.getElementById('min_delay').value = val;
-                document.getElementById('step3-min-delay').value = val;
-            } else {
-                document.getElementById('max_delay').value = val;
-                document.getElementById('step3-max-delay').value = val;
-            }
+            const target = document.getElementById(type === 'min' ? 'min_delay' : 'max_delay');
+            if (target) target.value = val;
             saveInputs();
-            updateSpeedLabel();
-        }
-
-        function updateSpeedLabel() {
-            const min = document.getElementById('min_delay').value;
-            const max = document.getElementById('max_delay').value;
-            document.getElementById('speed-label').innerText = `Custom (${min}-${max}s)`;
+            syncSpeedUI();
         }
 
         async function changeLiveSpeed(val) {
-            document.getElementById('live-speed-val').innerText = val + 's';
+            const clamped = clampLiveSpeed(val);
+            if (clamped === null) return;
+            setLiveSpeedUI(clamped);
             if (!currentTaskId) return;
             try {
                 await fetch(`/api/task/speed/${currentTaskId}`, {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ min_delay: parseFloat(val), max_delay: parseFloat(val) + 1.5 })
+                    body: JSON.stringify({ min_delay: clamped, max_delay: clamped + 1.5 })
                 });
             } catch (e) {}
         }
@@ -1440,17 +1668,25 @@ HTML_TEMPLATE = """
                     el.value = saved;
                 }
             });
-            const minVal = document.getElementById('min_delay').value || 3;
-            const maxVal = document.getElementById('max_delay').value || 6;
-            document.getElementById('step3-min-delay').value = minVal;
-            document.getElementById('step3-max-delay').value = maxVal;
-            document.getElementById('live-speed-slider').value = minVal;
-            document.getElementById('live-speed-val').innerText = minVal + 's';
-            updateSpeedLabel();
+            const minEl = document.getElementById('min_delay');
+            const maxEl = document.getElementById('max_delay');
+            if (minEl && !minEl.value) minEl.value = 3;
+            if (maxEl && !maxEl.value) maxEl.value = 6;
+            syncSpeedUI();
         }
 
         function clearSavedData() {
-            showCustomModal("Reset Credentials", "Are you sure you want to reset all stored API credentials?", "danger", () => {
+            showCustomModal("Reset Credentials", "Are you sure you want to reset all stored API credentials?", "danger", async () => {
+                const staleSession = localStorage.getItem('tg_session_id');
+                if (staleSession) {
+                    try {
+                        await fetch('/api/auth/logout', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({ session_id: staleSession })
+                        });
+                    } catch (e) {}
+                }
                 FIELD_KEYS.forEach(k => localStorage.removeItem('tg_' + k));
                 localStorage.removeItem('tg_session_id');
                 location.reload();
@@ -1573,9 +1809,9 @@ HTML_TEMPLATE = """
                 if (json.status === 'success') {
                     loadedChats = json.chats;
                     renderChats(loadedChats);
-                } else if (isSessionExpired(res, json)) {
-                    renderDialogsError('Session expired - please log in again.');
-                    showToast('Session expired - please log in again', 'error');
+                } else if (isSessionExpired(res, json) || json.error === 'session_not_found') {
+                    // Routes straight to the login step, so Retry can never loop.
+                    handleSessionExpired();
                 } else {
                     renderDialogsError(json.message || 'Failed to load dialogs');
                     showToast(json.message || 'Failed to load dialogs', 'error');
@@ -1666,12 +1902,15 @@ HTML_TEMPLATE = """
 
         function selectByType(type) {
             document.querySelectorAll('.chat-checkbox').forEach(cb => {
-                if (cb.disabled) { cb.checked = false; return; }
-                if (cb.dataset.type && cb.dataset.type.includes(type)) {
-                    cb.checked = true;
-                } else {
-                    cb.checked = false;
-                }
+                const row = cb.closest('.chat-row');
+                if (!row || row.style.display === 'none') return;
+                if (cb.disabled) return;
+                const cbType = cb.dataset.type || '';
+                // Mirrors applyChatVisibility: supergroups count as groups.
+                const matches = type === 'Group'
+                    ? (cbType === 'Group' || cbType === 'Supergroup')
+                    : cbType === type;
+                cb.checked = matches;
             });
             updateCount();
         }
@@ -1738,99 +1977,113 @@ HTML_TEMPLATE = """
                 const json = await res.json();
                 if (json.status === 'success') {
                     currentTaskId = json.task_id;
+                    currentTaskStatus = 'starting';
                     document.getElementById('step-select').classList.add('hidden');
-                    document.getElementById('live-speed-slider').value = minD;
-                    document.getElementById('live-speed-val').innerText = minD + 's';
+                    setLiveSpeedUI(minD);
                     showProgress();
                     showToast(`Cleanup task started for ${checked.length} item(s)`, 'success');
                 } else if (isSessionExpired(res, json)) {
-                    showToast('Session expired - please log in again', 'error');
-                    btn.disabled = false;
-                    btn.innerHTML = '<i class="fa-solid fa-trash-can mr-2"></i> Leave & Clean Selected';
+                    handleSessionExpired();
+                } else if (res.status === 409 && json.error === 'task_already_running' && json.task_id) {
+                    // Re-attach to the task the server is already running.
+                    currentTaskId = json.task_id;
+                    currentTaskStatus = 'running';
+                    document.getElementById('step-select').classList.add('hidden');
+                    showProgress();
+                    showToast('A cleanup task is already running for this session', 'info');
                 } else {
                     showToast(json.message || 'Failed to start task.', 'error');
-                    btn.disabled = false;
-                    btn.innerHTML = '<i class="fa-solid fa-trash-can mr-2"></i> Leave & Clean Selected';
+                    resetLeaveButton();
                 }
             } catch (err) {
                 showToast('Network error: ' + String(err), 'error');
-                btn.disabled = false;
-                btn.innerHTML = '<i class="fa-solid fa-trash-can mr-2"></i> Leave & Clean Selected';
+                resetLeaveButton();
             }
+        }
+
+        function resetLeaveButton() {
+            const btn = document.getElementById('btn-leave-selected');
+            btn.disabled = false;
+            btn.innerHTML = '<i class="fa-solid fa-trash-can mr-2"></i> Leave & Clean Selected';
         }
 
         function showProgress() {
             document.getElementById('step-progress').classList.remove('hidden');
-            const b = document.getElementById('badge');
-            const bm = document.getElementById('badge-mobile');
-            if (b) {
-                b.className = "hidden sm:inline-block px-3 py-1.5 text-xs font-semibold rounded-full bg-cyan-900/50 text-cyan-400 border border-cyan-700/50";
-                b.innerText = "Running";
-            }
-            if (bm) {
-                bm.className = "px-2.5 py-1 text-[11px] font-semibold rounded-full bg-cyan-900/50 text-cyan-400 border border-cyan-700/50";
-                bm.innerText = "Running";
-            }
-
-            if (pollInterval) clearInterval(pollInterval);
+            setBadge('Running', 'running');
+            pollFailures = 0;
+            stopPolling();
             pollInterval = setInterval(updateTaskStatus, 1500);
         }
 
         async function updateTaskStatus() {
             if (!currentTaskId) return;
+            let task = null;
             try {
                 const res = await fetch(`/api/task/status/${currentTaskId}`);
                 if (!res.ok) {
-                    if (res.status === 401) {
-                        let err = null;
-                        try { err = await res.clone().json(); } catch (e) {}
-                        if (err && err.error === 'session_expired') {
-                            if (pollInterval) clearInterval(pollInterval);
-                            showToast('Session expired - please log in again', 'error');
-                        }
+                    let err = null;
+                    try { err = await res.clone().json(); } catch (e) {}
+                    if (isSessionExpired(res, err)) {
+                        stopPolling();
+                        handleSessionExpired();
+                        return;
                     }
+                    // e.g. 404 after a server restart: kill the badge, no zombie "Running".
+                    stopPolling();
+                    currentTaskStatus = 'error';
+                    setBadge('ERROR', 'error');
+                    showToast('Task not found — server may have restarted', 'error');
                     return;
                 }
-                const task = await res.json();
-
-                document.getElementById('stat-total').innerText = task.total || 0;
-                document.getElementById('stat-left').innerText = task.left || 0;
-                document.getElementById('stat-failed').innerText = task.failed || 0;
-
-                const percent = task.total > 0 ? Math.round(((task.current_index || 0) / task.total) * 100) : 0;
-                document.getElementById('progress-bar').style.width = percent + '%';
-
-                if (task.current_name) {
-                    const delayInfo = task.current_delay ? ` (Delay: ${task.current_delay}s)` : '';
-                    document.getElementById('current-action').innerText = `[${task.current_index}/${task.total}] Processing: ${task.current_name}${delayInfo}`;
+                pollFailures = 0;
+                task = await res.json();
+            } catch (err) {
+                pollFailures++;
+                if (pollFailures >= 3) {
+                    stopPolling();
+                    currentTaskStatus = 'error';
+                    setBadge('ERROR', 'error');
+                    showToast('Lost contact with the server — task status unavailable', 'error');
                 }
+                return;
+            }
 
-                currentLogs = task.logs || [];
-                const logsBox = document.getElementById('logs-box');
-                // Log lines carry Telegram-sourced entity names: build them with
-                // textContent so a hostile title can never inject markup.
-                logsBox.textContent = '';
-                const logFragment = document.createDocumentFragment();
-                currentLogs.forEach(line => {
-                    const row = document.createElement('div');
-                    row.textContent = line;
-                    logFragment.appendChild(row);
-                });
-                logsBox.appendChild(logFragment);
-                logsBox.scrollTop = logsBox.scrollHeight;
+            currentTaskStatus = task.status;
 
-                if (['completed', 'cancelled', 'error'].includes(task.status)) {
-                    clearInterval(pollInterval);
-                    const bClass = task.status === 'completed' 
-                        ? "px-2.5 py-1 text-[11px] sm:px-3 sm:py-1.5 sm:text-xs font-semibold rounded-full bg-emerald-900/50 text-emerald-400 border border-emerald-700/50"
-                        : "px-2.5 py-1 text-[11px] sm:px-3 sm:py-1.5 sm:text-xs font-semibold rounded-full bg-rose-900/50 text-rose-400 border border-rose-700/50";
-                    
-                    const b = document.getElementById('badge');
-                    const bm = document.getElementById('badge-mobile');
-                    if (b) { b.className = "hidden sm:inline-block " + bClass; b.innerText = task.status.toUpperCase(); }
-                    if (bm) { bm.className = bClass; bm.innerText = task.status.toUpperCase(); }
+            document.getElementById('stat-total').innerText = task.total || 0;
+            document.getElementById('stat-left').innerText = task.left || 0;
+            document.getElementById('stat-failed').innerText = task.failed || 0;
+
+            const percent = task.total > 0 ? Math.round(((task.current_index || 0) / task.total) * 100) : 0;
+            document.getElementById('progress-bar').style.width = percent + '%';
+
+            if (task.current_name) {
+                const delayInfo = task.current_delay ? ` (Delay: ${task.current_delay}s)` : '';
+                document.getElementById('current-action').innerText = `[${task.current_index}/${task.total}] Processing: ${task.current_name}${delayInfo}`;
+            }
+
+            currentLogs = task.logs || [];
+            const logsBox = document.getElementById('logs-box');
+            // Log lines carry Telegram-sourced entity names: build them with
+            // textContent so a hostile title can never inject markup.
+            logsBox.textContent = '';
+            const logFragment = document.createDocumentFragment();
+            currentLogs.forEach(line => {
+                const row = document.createElement('div');
+                row.textContent = line;
+                logFragment.appendChild(row);
+            });
+            logsBox.appendChild(logFragment);
+            logsBox.scrollTop = logsBox.scrollHeight;
+
+            if (['completed', 'cancelled', 'error'].includes(task.status)) {
+                stopPolling();
+                if (task.status === 'completed') {
+                    setBadge('COMPLETED', 'success');
+                } else {
+                    setBadge(task.status.toUpperCase(), 'error');
                 }
-            } catch (err) {}
+            }
         }
 
         function exportLogs() {
@@ -1853,14 +2106,52 @@ HTML_TEMPLATE = """
             showToast('Stop requested — task will halt after the current item', 'info');
         }
 
+        function taskIsStillActive() {
+            return !!currentTaskId && (currentTaskStatus === 'running' || currentTaskStatus === 'starting');
+        }
+
         function returnToSelection() {
-            if (pollInterval) clearInterval(pollInterval);
+            if (taskIsStillActive()) {
+                showCustomModal(
+                    "Task Running",
+                    "A cleanup task is still running. Stop it and go back?",
+                    "danger",
+                    stopTaskAndReturnToSelection
+                );
+                return;
+            }
+            navigateToSelection();
+        }
+
+        async function stopTaskAndReturnToSelection() {
+            const taskId = currentTaskId;
+            if (taskId) {
+                try {
+                    await fetch(`/api/task/stop/${taskId}`, { method: 'POST' });
+                } catch (e) {}
+                showToast('Stop requested — waiting for the task to halt', 'info');
+                for (let i = 0; i < 10; i++) {
+                    try {
+                        const res = await fetch(`/api/task/status/${taskId}`);
+                        if (res.ok) {
+                            const t = await res.json();
+                            if (['cancelled', 'completed', 'error'].includes(t.status)) break;
+                        }
+                    } catch (e) {}
+                    await new Promise(resolve => setTimeout(resolve, 500));
+                }
+            }
+            navigateToSelection();
+        }
+
+        function navigateToSelection() {
+            stopPolling();
+            currentTaskId = null;
+            currentTaskStatus = null;
             document.getElementById('step-progress').classList.add('hidden');
             document.getElementById('step-select').classList.remove('hidden');
-            const b = document.getElementById('badge');
-            const bm = document.getElementById('badge-mobile');
-            if (b) { b.innerText = "Selection Mode"; b.className = "hidden sm:inline-block px-3 py-1.5 text-xs font-semibold rounded-full bg-slate-800 text-slate-400"; }
-            if (bm) { bm.innerText = "Selection Mode"; bm.className = "px-2.5 py-1 text-[11px] font-semibold rounded-full bg-slate-800 text-slate-400"; }
+            setBadge('Selection Mode', 'idle');
+            resetLeaveButton();
             loadChatsList();
         }
 
@@ -1881,8 +2172,9 @@ def robots_txt():
         "User-agent: *\n"
         "Allow: /\n"
         "Disallow: /api/\n"
-        f"Sitemap: {SITE_URL}/sitemap.xml\n"
     )
+    if SITE_URL_IS_CUSTOM:
+        body += f"Sitemap: {SITE_URL}/sitemap.xml\n"
     return Response(body, mimetype="text/plain")
 
 
@@ -1910,18 +2202,18 @@ def send_code():
     phone = _get_str(data, "phone", required=True, max_len=32, pattern=r"\+?\d{7,15}")
     bot_token = _get_str(data, "bot_token", max_len=128)
     log_user_id = _get_str(data, "log_user_id", max_len=64)
-
-    # Per-IP cooldown (1 attempt / 60s), checked before the slower range
-    # validation so retry storms of a valid-shaped body get 429, not 400.
-    if _send_code_rate_limited():
-        return jsonify({"status": "error", "error": "too_many_requests",
-                        "message": "Too many login attempts. Please wait 60 seconds."}), 429
-
     min_delay, max_delay = _get_delays(data, 3, 6)
 
     digits = sanitize_phone_digits(phone)
     if digits is None:
         raise InputValidationError("phone must contain between 7 and 15 digits")
+
+    # Every validation passed: only now consume the per-IP cooldown window
+    # (1 attempt / 60s) right before the code is actually sent.
+    remaining = _cooldown_remaining(_send_code_last_attempt, SEND_CODE_COOLDOWN_SECONDS)
+    if remaining:
+        return _too_many_requests(remaining, "Too many login attempts. Please wait 60 seconds.")
+
     session_id = str(uuid.uuid4())
     session_file = os.path.join("tg_sessions", f"sess_{digits}")
 
@@ -1987,6 +2279,12 @@ def verify_code():
     if not code and not password:
         raise InputValidationError("verification code or password is required")
 
+    # Shape is valid: consume the per-IP verify cooldown (1 attempt / 30s)
+    # before touching the session store or Telegram.
+    remaining = _cooldown_remaining(_verify_last_attempt, VERIFY_CODE_COOLDOWN_SECONDS)
+    if remaining:
+        return _too_many_requests(remaining, "Too many verification attempts. Please wait 30 seconds.")
+
     sess = sessions_store.get(session_id)
     if not sess:
         return jsonify({"status": "error", "error": "session_not_found",
@@ -2022,6 +2320,34 @@ def verify_code():
         return jsonify(res)
     except Exception as e:
         return session_error_response(e)
+
+
+@app.route("/api/auth/logout", methods=["POST"])
+@json_errors
+def logout_session():
+    """Best-effort session teardown so the frontend always has an exit path.
+
+    Idempotent by design: an unknown or already-removed session_id still 200s.
+    """
+    data = request.get_json(silent=True) or {}
+    session_id = _get_str(data, "session_id", max_len=64)
+
+    sess = sessions_store.pop(session_id, None) if session_id else None
+    if sess is not None:
+        sess["connected"] = False
+        client = sess.get("client")
+        if client is not None:
+            async def _disconnect():
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+
+            try:
+                asyncio.run_coroutine_threadsafe(_disconnect(), loop).result(timeout=10)
+            except Exception:
+                pass
+    return jsonify({"status": "ok"})
 
 
 @app.route("/api/dialogs/<session_id>")
@@ -2065,6 +2391,13 @@ def start_task():
     exclude_ids = _get_id_list(data, "exclude_ids")
     min_delay, max_delay = _get_delays(data, 3.0, 6.0)
 
+    # Single-task guard: one cleanup task per session at a time.
+    for existing_id, existing in tasks_store.items():
+        if existing.get("session_id") == session_id and existing.get("status") in ("starting", "running"):
+            return jsonify({"status": "error", "error": "task_already_running",
+                            "task_id": existing_id,
+                            "message": "A cleanup task is already running for this session."}), 409
+
     sess = sessions_store.get(session_id)
     if not sess:
         return jsonify({"status": "error", "error": "session_expired",
@@ -2089,6 +2422,7 @@ def start_task():
     task_id = str(uuid.uuid4())
     tasks_store[task_id] = {
         "status": "starting", "total": len(selected_entities), "current_index": 0, "current_name": "",
+        "session_id": session_id,
         "min_delay": min_delay, "max_delay": max_delay, "current_delay": min_delay,
         "left": 0, "failed": 0, "protected": 0, "exclude_ids": sorted(set(exclude_ids)),
         "logs": [], "cancelled": False
