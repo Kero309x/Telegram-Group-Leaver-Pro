@@ -212,9 +212,13 @@ async def execute_leaving_process(task_id: str, client: TelegramClient, targets:
     """Executes the batch removal process with real-time feedback."""
     task = tasks_store[task_id]
     total = len(targets)
+    exclude_ids = {str(x) for x in task.get("exclude_ids", [])}
+    protected_count = 0
     task["total"] = total
     task["status"] = "running"
     task["logs"].append(f"[{time.strftime('%H:%M:%S')}] Started task for {total} selected item(s)...")
+    if exclude_ids:
+        task["logs"].append(f"[{time.strftime('%H:%M:%S')}] {len(exclude_ids)} protected favorite(s) excluded from cleanup.")
 
     left_count = 0
     failed_count = 0
@@ -227,6 +231,15 @@ async def execute_leaving_process(task_id: str, client: TelegramClient, targets:
                 break
 
             name = entity_display_name(entity)
+
+            if str(entity.id) in exclude_ids:
+                protected_count += 1
+                task["protected"] = protected_count
+                task["current_index"] = idx
+                task["current_name"] = name
+                task["logs"].append(f"[{time.strftime('%H:%M:%S')}] [{idx}/{total}] [Protected] Favorite skipped: {name}")
+                continue
+
             etype = get_entity_type(entity)
             task["current_index"] = idx
             task["current_name"] = name
@@ -329,6 +342,25 @@ HTML_TEMPLATE = """
         ::-webkit-scrollbar-track { background: #090d16; }
         ::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 4px; }
         ::-webkit-scrollbar-thumb:hover { background: #334155; }
+
+        button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible, [role="tab"]:focus-visible {
+            outline: none;
+            box-shadow: 0 0 0 2px #020617, 0 0 0 4px rgba(34, 211, 238, 0.75);
+        }
+
+        @keyframes toast-in { from { opacity: 0; transform: translateX(18px) scale(0.97); } to { opacity: 1; transform: translateX(0) scale(1); } }
+        @keyframes toast-out { from { opacity: 1; } to { opacity: 0; transform: translateX(18px) scale(0.97); } }
+        .toast-in { animation: toast-in 0.28s cubic-bezier(0.16, 1, 0.3, 1); }
+        .toast-out { animation: toast-out 0.22s ease forwards; }
+
+        @keyframes star-pop { 0% { transform: scale(1); } 45% { transform: scale(1.35) rotate(12deg); } 100% { transform: scale(1); } }
+        .fav-btn.pop i { animation: star-pop 0.32s ease; }
+
+        @keyframes progress-shimmer { to { transform: translateX(100%); } }
+        .progress-fill { box-shadow: 0 0 12px rgba(34, 211, 238, 0.55), 0 0 24px rgba(168, 85, 247, 0.3); }
+        .progress-fill::after { content: ""; position: absolute; inset: 0; background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.3), transparent); transform: translateX(-100%); animation: progress-shimmer 1.8s linear infinite; }
+
+        .chat-row:active { transform: scale(0.997); }
     </style>
     <script type="application/ld+json">
     {
@@ -351,7 +383,7 @@ HTML_TEMPLATE = """
     <div class="max-w-4xl w-full mx-auto space-y-4 sm:space-y-6">
         
         <!-- Header -->
-        <header class="bg-slate-900/90 backdrop-blur-md border border-slate-800/80 rounded-2xl p-4 sm:p-5 shadow-2xl flex flex-col sm:flex-row items-center justify-between gap-3 sm:gap-4">
+        <header class="sticky top-0 sm:top-3 z-40 bg-slate-900/95 backdrop-blur-md border border-slate-800/80 rounded-2xl p-4 sm:p-5 shadow-2xl flex flex-col sm:flex-row items-center justify-between gap-3 sm:gap-4">
             <div class="flex items-center space-x-3.5 w-full sm:w-auto justify-between sm:justify-start">
                 <div class="flex items-center space-x-3">
                     <div class="w-11 h-11 sm:w-12 sm:h-12 rounded-xl bg-gradient-to-tr from-cyan-500 via-sky-500 to-purple-600 flex items-center justify-center shadow-lg shadow-cyan-500/25 flex-shrink-0">
@@ -416,27 +448,27 @@ HTML_TEMPLATE = """
 
             <div class="grid grid-cols-1 md:grid-cols-2 gap-3 sm:gap-4">
                 <div>
-                    <label class="block text-xs font-medium text-slate-300 mb-1.5">API ID <span class="text-rose-400">*</span></label>
+                    <label for="api_id" class="block text-xs font-medium text-slate-300 mb-1.5">API ID <span class="text-rose-400">*</span></label>
                     <input id="api_id" oninput="saveInputs()" type="number" placeholder="e.g. 12345678" class="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-sm focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 focus:outline-none transition">
                 </div>
                 <div>
-                    <label class="block text-xs font-medium text-slate-300 mb-1.5">API Hash <span class="text-rose-400">*</span></label>
+                    <label for="api_hash" class="block text-xs font-medium text-slate-300 mb-1.5">API Hash <span class="text-rose-400">*</span></label>
                     <input id="api_hash" oninput="saveInputs()" type="text" placeholder="e.g. 0123456789abcdef..." class="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-sm focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 focus:outline-none transition">
                 </div>
             </div>
 
             <div>
-                <label class="block text-xs font-medium text-slate-300 mb-1.5">Phone Number (With country code +) <span class="text-rose-400">*</span></label>
+                <label for="phone" class="block text-xs font-medium text-slate-300 mb-1.5">Phone Number (With country code +) <span class="text-rose-400">*</span></label>
                 <input id="phone" oninput="saveInputs()" type="text" placeholder="+1234567890" class="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-sm focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 focus:outline-none transition">
             </div>
 
             <div class="grid grid-cols-1 md:grid-cols-2 gap-3 sm:gap-4">
                 <div>
-                    <label class="block text-xs font-medium text-slate-300 mb-1.5">Bot Token <span class="text-slate-500">(Optional for logs)</span></label>
+                    <label for="bot_token" class="block text-xs font-medium text-slate-300 mb-1.5">Bot Token <span class="text-slate-500">(Optional for logs)</span></label>
                     <input id="bot_token" oninput="saveInputs()" type="text" placeholder="123456:ABC-DEF..." class="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-sm focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 focus:outline-none transition">
                 </div>
                 <div>
-                    <label class="block text-xs font-medium text-slate-300 mb-1.5">Log Telegram User ID <span class="text-slate-500">(Optional)</span></label>
+                    <label for="log_user_id" class="block text-xs font-medium text-slate-300 mb-1.5">Log Telegram User ID <span class="text-slate-500">(Optional)</span></label>
                     <input id="log_user_id" oninput="saveInputs()" type="text" placeholder="987654321" class="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-sm focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 focus:outline-none transition">
                 </div>
             </div>
@@ -464,14 +496,14 @@ HTML_TEMPLATE = """
                     </button>
                 </div>
                 <div class="grid grid-cols-2 gap-3 pt-1">
-                    <div>
-                        <label class="block text-[11px] text-slate-400 mb-0.5">Min Delay (sec)</label>
-                        <input id="min_delay" oninput="saveInputs(); updateSpeedLabel();" type="number" step="0.5" value="3" class="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-cyan-500">
-                    </div>
-                    <div>
-                        <label class="block text-[11px] text-slate-400 mb-0.5">Max Delay (sec)</label>
-                        <input id="max_delay" oninput="saveInputs(); updateSpeedLabel();" type="number" step="0.5" value="6" class="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-cyan-500">
-                    </div>
+                <div>
+                    <label for="min_delay" class="block text-[11px] text-slate-400 mb-0.5">Min Delay (sec)</label>
+                    <input id="min_delay" oninput="saveInputs(); updateSpeedLabel();" type="number" step="0.5" value="3" class="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-cyan-500">
+                </div>
+                <div>
+                    <label for="max_delay" class="block text-[11px] text-slate-400 mb-0.5">Max Delay (sec)</label>
+                    <input id="max_delay" oninput="saveInputs(); updateSpeedLabel();" type="number" step="0.5" value="6" class="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-cyan-500">
+                </div>
                 </div>
             </div>
 
@@ -486,11 +518,11 @@ HTML_TEMPLATE = """
                 <i class="fa-solid fa-shield-halved text-cyan-400 mr-2.5 text-sm"></i> 2. Verify Login Code
             </h2>
             <div id="otp-container">
-                <label class="block text-xs font-medium text-slate-300 mb-1.5">Enter Verification Code (Sent inside Telegram app)</label>
+                <label for="otp_code" class="block text-xs font-medium text-slate-300 mb-1.5">Enter Verification Code (Sent inside Telegram app)</label>
                 <input id="otp_code" type="text" placeholder="12345" class="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-base sm:text-sm focus:border-cyan-500 focus:outline-none font-mono">
             </div>
             <div id="pwd-container" class="hidden">
-                <label class="block text-xs font-medium text-slate-300 mb-1.5">Enter 2FA Password</label>
+                <label for="password_2fa" class="block text-xs font-medium text-slate-300 mb-1.5">Enter 2FA Password</label>
                 <input id="password_2fa" type="password" placeholder="••••••••" class="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-base sm:text-sm focus:border-cyan-500 focus:outline-none">
             </div>
             <button onclick="submitVerify()" id="btn-verify" class="w-full py-3.5 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-xl transition shadow-lg shadow-emerald-500/20 flex items-center justify-center text-sm">
@@ -543,7 +575,42 @@ HTML_TEMPLATE = """
             <!-- Search Bar -->
             <div class="relative">
                 <i class="fa-solid fa-search absolute left-3.5 top-3.5 text-slate-500 text-sm"></i>
-                <input id="search-input" onkeyup="filterChats()" type="text" placeholder="Search by name, username, or bot..." class="w-full bg-slate-950 border border-slate-800 rounded-xl pl-10 pr-4 py-2.5 text-sm focus:border-cyan-500 focus:outline-none">
+                <input id="search-input" onkeyup="filterChats()" type="text" aria-label="Search dialogs by name or username" placeholder="Search by name, username, or bot..." class="w-full bg-slate-950 border border-slate-800 rounded-xl pl-10 pr-4 py-2.5 text-sm focus:border-cyan-500 focus:outline-none">
+            </div>
+
+            <!-- Dialog Filter & Favorites Bar -->
+            <div class="bg-slate-950/70 border border-slate-800 rounded-xl p-2.5 space-y-2">
+                <div class="flex flex-wrap items-center gap-1.5">
+                    <div class="flex flex-wrap items-center gap-1.5" role="tablist" aria-label="Filter dialogs">
+                        <button type="button" role="tab" data-filter="all" aria-selected="true" onclick="setChatFilter('all')" class="chat-filter-btn px-3 py-2 min-h-[36px] rounded-lg border text-xs font-medium transition flex items-center gap-1.5 bg-cyan-950/60 border-cyan-500/70 text-cyan-300">
+                            All <span id="cnt-all" class="filter-count text-[10px] font-bold bg-slate-950/70 border border-slate-800 px-1.5 py-0.5 rounded-full min-w-[1.4rem] text-center">0</span>
+                        </button>
+                        <button type="button" role="tab" data-filter="favorites" aria-selected="false" onclick="setChatFilter('favorites')" class="chat-filter-btn px-3 py-2 min-h-[36px] rounded-lg border text-xs font-medium transition flex items-center gap-1.5 bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200 hover:border-slate-700">
+                            <i class="fa-solid fa-star text-[10px] text-amber-400"></i> Favorites <span id="cnt-favorites" class="filter-count text-[10px] font-bold bg-slate-950/70 border border-slate-800 px-1.5 py-0.5 rounded-full min-w-[1.4rem] text-center">0</span>
+                        </button>
+                        <button type="button" role="tab" data-filter="Channel" aria-selected="false" onclick="setChatFilter('Channel')" class="chat-filter-btn px-3 py-2 min-h-[36px] rounded-lg border text-xs font-medium transition flex items-center gap-1.5 bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200 hover:border-slate-700">
+                            Channels <span id="cnt-Channel" class="filter-count text-[10px] font-bold bg-slate-950/70 border border-slate-800 px-1.5 py-0.5 rounded-full min-w-[1.4rem] text-center">0</span>
+                        </button>
+                        <button type="button" role="tab" data-filter="Group" aria-selected="false" onclick="setChatFilter('Group')" class="chat-filter-btn px-3 py-2 min-h-[36px] rounded-lg border text-xs font-medium transition flex items-center gap-1.5 bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200 hover:border-slate-700">
+                            Groups <span id="cnt-Group" class="filter-count text-[10px] font-bold bg-slate-950/70 border border-slate-800 px-1.5 py-0.5 rounded-full min-w-[1.4rem] text-center">0</span>
+                        </button>
+                        <button type="button" role="tab" data-filter="Bot" aria-selected="false" onclick="setChatFilter('Bot')" class="chat-filter-btn px-3 py-2 min-h-[36px] rounded-lg border text-xs font-medium transition flex items-center gap-1.5 bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200 hover:border-slate-700">
+                            Bots <span id="cnt-Bot" class="filter-count text-[10px] font-bold bg-slate-950/70 border border-slate-800 px-1.5 py-0.5 rounded-full min-w-[1.4rem] text-center">0</span>
+                        </button>
+                    </div>
+                    <button type="button" onclick="invertSelection()" title="Invert selection of visible items" class="px-3 py-2 min-h-[36px] rounded-lg border border-dashed border-slate-700 bg-slate-900 text-slate-400 hover:text-slate-200 hover:border-slate-500 text-xs font-medium transition flex items-center gap-1.5">
+                        <i class="fa-solid fa-arrow-right-arrow-left text-[10px]"></i> Invert selection
+                    </button>
+                </div>
+                <div class="flex flex-wrap items-center gap-1.5 pt-2 border-t border-slate-800/70">
+                    <button type="button" onclick="favoriteAllSelected()" class="px-3 py-2 min-h-[36px] rounded-lg bg-amber-950/40 border border-amber-800/50 text-amber-300 hover:bg-amber-900/50 text-xs font-medium transition flex items-center gap-1.5">
+                        <i class="fa-solid fa-star text-[10px]"></i> Favorite all selected
+                    </button>
+                    <button type="button" onclick="unfavoriteAll()" class="px-3 py-2 min-h-[36px] rounded-lg bg-slate-900 border border-slate-800 text-slate-400 hover:text-slate-200 hover:border-slate-700 text-xs font-medium transition flex items-center gap-1.5">
+                        <i class="fa-regular fa-star text-[10px]"></i> Unfavorite all
+                    </button>
+                    <span class="text-[11px] text-slate-500 ml-auto hidden sm:flex items-center gap-1"><i class="fa-solid fa-shield-halved"></i> Favorites auto-save in this browser</span>
+                </div>
             </div>
 
             <!-- Chats Table Container -->
@@ -604,7 +671,7 @@ HTML_TEMPLATE = """
 
             <!-- Progress Bar -->
             <div class="w-full bg-slate-950 rounded-full h-3 border border-slate-800 overflow-hidden">
-                <div id="progress-bar" class="bg-gradient-to-r from-cyan-500 to-purple-500 h-full w-0 transition-all duration-300"></div>
+                <div id="progress-bar" class="progress-fill relative overflow-hidden bg-gradient-to-r from-cyan-500 to-purple-500 h-full w-0 transition-all duration-300"></div>
             </div>
 
             <p id="current-action" class="text-[11px] sm:text-xs text-slate-400 truncate font-mono">Preparing task...</p>
@@ -615,6 +682,9 @@ HTML_TEMPLATE = """
         </section>
 
     </div>
+
+    <!-- Toast Notification Stack -->
+    <div id="toast-container" class="fixed top-3 right-3 sm:top-4 sm:right-4 z-[60] flex flex-col gap-2 w-[calc(100vw-1.5rem)] max-w-xs sm:max-w-sm pointer-events-none" role="status" aria-live="polite"></div>
 
     <!-- Custom Glassmorphic Modal Component -->
     <div id="custom-modal" class="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-md flex items-center justify-center p-4 hidden">
@@ -657,6 +727,8 @@ HTML_TEMPLATE = """
         let loadedChats = [];
         let currentLogs = [];
         let modalConfirmCallback = null;
+        let favoriteIds = new Set();
+        let activeChatFilter = 'all';
 
         const FIELD_KEYS = ['api_id', 'api_hash', 'phone', 'bot_token', 'log_user_id', 'min_delay', 'max_delay'];
 
@@ -666,6 +738,209 @@ HTML_TEMPLATE = """
             'safe': { min: 3, max: 6, label: 'Safe (3-6s)' },
             'stealth': { min: 8, max: 15, label: 'Stealth (8-15s)' }
         };
+
+        const FAV_STORAGE_KEY = 'tg_favs';
+
+        const FILTER_BTN_BASE = 'chat-filter-btn px-3 py-2 min-h-[36px] rounded-lg border text-xs font-medium transition flex items-center gap-1.5';
+        const FILTER_BTN_ACTIVE = FILTER_BTN_BASE + ' bg-cyan-950/60 border-cyan-500/70 text-cyan-300';
+        const FILTER_BTN_IDLE = FILTER_BTN_BASE + ' bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200 hover:border-slate-700';
+
+        const FAV_BTN_BASE = 'fav-btn flex-shrink-0 w-9 h-9 sm:w-8 sm:h-8 rounded-lg flex items-center justify-center text-sm transition active:scale-90';
+
+        const TOAST_STYLES = {
+            success: { bar: 'border-l-emerald-500', icon: 'fa-circle-check', iconClass: 'text-emerald-400' },
+            error: { bar: 'border-l-rose-500', icon: 'fa-circle-exclamation', iconClass: 'text-rose-400' },
+            info: { bar: 'border-l-cyan-500', icon: 'fa-circle-info', iconClass: 'text-cyan-400' }
+        };
+
+        function escapeHtml(value) {
+            const entities = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+            return String(value).replace(/[&<>"']/g, ch => entities[ch]);
+        }
+
+        function showToast(message, type = 'info') {
+            const container = document.getElementById('toast-container');
+            if (!container) return;
+            const style = TOAST_STYLES[type] || TOAST_STYLES.info;
+            const toast = document.createElement('div');
+            toast.className = `pointer-events-auto flex items-start gap-2.5 w-full bg-slate-900/95 backdrop-blur-md border border-slate-700/70 ${style.bar} border-l-4 rounded-xl shadow-2xl px-3.5 py-3 toast-in`;
+            toast.innerHTML = `
+                <i class="fa-solid ${style.icon} ${style.iconClass} text-sm mt-0.5 flex-shrink-0"></i>
+                <span class="flex-1 text-xs leading-relaxed text-slate-200 break-words">${escapeHtml(message)}</span>
+                <button type="button" aria-label="Dismiss notification" class="text-slate-500 hover:text-slate-200 transition flex-shrink-0 px-1 -my-0.5">
+                    <i class="fa-solid fa-xmark text-xs"></i>
+                </button>
+            `;
+            const dismiss = () => {
+                if (toast.dataset.closing) return;
+                toast.dataset.closing = '1';
+                toast.classList.remove('toast-in');
+                toast.classList.add('toast-out');
+                setTimeout(() => toast.remove(), 240);
+            };
+            toast.querySelector('button').addEventListener('click', dismiss);
+            container.prepend(toast);
+            while (container.children.length > 4) container.lastElementChild.remove();
+            setTimeout(dismiss, 4200);
+        }
+
+        function loadFavorites() {
+            try {
+                const raw = localStorage.getItem(FAV_STORAGE_KEY);
+                const parsed = raw ? JSON.parse(raw) : [];
+                return new Set(Array.isArray(parsed) ? parsed.map(v => String(v)) : []);
+            } catch (e) {
+                return new Set();
+            }
+        }
+
+        function saveFavorites() {
+            try {
+                localStorage.setItem(FAV_STORAGE_KEY, JSON.stringify(Array.from(favoriteIds)));
+            } catch (e) {}
+        }
+
+        function toggleFavorite(id) {
+            const nowFavorite = !favoriteIds.has(id);
+            if (nowFavorite) favoriteIds.add(id); else favoriteIds.delete(id);
+            saveFavorites();
+            applyFavoriteStates();
+            const btn = document.querySelector(`[data-fav-btn="${id}"]`);
+            if (btn) {
+                btn.classList.remove('pop');
+                void btn.offsetWidth;
+                btn.classList.add('pop');
+            }
+            showToast(nowFavorite ? 'Added to favorites and protected from cleanup' : 'Removed from favorites', nowFavorite ? 'success' : 'info');
+        }
+
+        function applyFavoriteStates() {
+            document.querySelectorAll('.chat-row').forEach(row => {
+                const id = row.dataset.id;
+                const isFav = favoriteIds.has(id);
+                row.dataset.fav = isFav ? '1' : '0';
+                row.classList.toggle('border-l-amber-400/70', isFav);
+                row.classList.toggle('bg-amber-950/10', isFav);
+                row.classList.toggle('border-l-transparent', !isFav);
+
+                const btn = row.querySelector('.fav-btn');
+                if (btn) {
+                    btn.className = FAV_BTN_BASE + (isFav
+                        ? ' text-amber-400 bg-amber-950/50 border border-amber-500/40'
+                        : ' text-slate-600 hover:text-amber-400 hover:bg-slate-800 border border-transparent');
+                    btn.innerHTML = isFav ? '<i class="fa-solid fa-star" aria-hidden="true"></i>' : '<i class="fa-regular fa-star" aria-hidden="true"></i>';
+                    btn.setAttribute('aria-pressed', isFav ? 'true' : 'false');
+                }
+
+                const cb = row.querySelector('.chat-checkbox');
+                if (cb) {
+                    cb.disabled = isFav;
+                    if (isFav) cb.checked = false;
+                }
+            });
+            updateFilterCounts();
+            updateCount();
+        }
+
+        function updateFilterCounts() {
+            const counts = { all: loadedChats.length, favorites: 0, Channel: 0, Group: 0, Bot: 0 };
+            loadedChats.forEach(c => {
+                if (favoriteIds.has(c.id)) counts.favorites++;
+                if (c.type === 'Channel') counts.Channel++;
+                else if (c.type === 'Bot') counts.Bot++;
+                else if (c.type === 'Group' || c.type === 'Supergroup') counts.Group++;
+            });
+            const countIds = { all: 'cnt-all', favorites: 'cnt-favorites', Channel: 'cnt-Channel', Group: 'cnt-Group', Bot: 'cnt-Bot' };
+            Object.entries(countIds).forEach(([key, elId]) => {
+                const el = document.getElementById(elId);
+                if (el) el.innerText = counts[key];
+            });
+        }
+
+        function setChatFilter(filter) {
+            activeChatFilter = filter;
+            document.querySelectorAll('.chat-filter-btn').forEach(b => {
+                const active = b.dataset.filter === filter;
+                b.setAttribute('aria-selected', active ? 'true' : 'false');
+                b.className = active ? FILTER_BTN_ACTIVE : FILTER_BTN_IDLE;
+            });
+            applyChatVisibility();
+        }
+
+        function applyChatVisibility() {
+            const q = document.getElementById('search-input').value.toLowerCase();
+            document.querySelectorAll('.chat-row').forEach(row => {
+                const text = row.innerText.toLowerCase();
+                const isFav = row.dataset.fav === '1';
+                const type = row.dataset.type || '';
+                let passFilter = true;
+                if (activeChatFilter === 'favorites') passFilter = isFav;
+                else if (activeChatFilter === 'Channel') passFilter = type === 'Channel';
+                else if (activeChatFilter === 'Group') passFilter = type === 'Group' || type === 'Supergroup';
+                else if (activeChatFilter === 'Bot') passFilter = type === 'Bot';
+                row.style.display = (passFilter && text.includes(q)) ? 'flex' : 'none';
+            });
+        }
+
+        function invertSelection() {
+            let selectedCount = 0;
+            document.querySelectorAll('.chat-row').forEach(row => {
+                if (row.style.display === 'none') return;
+                const cb = row.querySelector('.chat-checkbox');
+                if (!cb || cb.disabled) return;
+                cb.checked = !cb.checked;
+                if (cb.checked) selectedCount++;
+            });
+            updateCount();
+            showToast(`Selection inverted: ${selectedCount} item(s) now selected`, 'info');
+        }
+
+        function favoriteAllSelected() {
+            const checked = Array.from(document.querySelectorAll('.chat-checkbox:checked'));
+            if (checked.length === 0) {
+                showToast('No items selected to favorite', 'error');
+                return;
+            }
+            checked.forEach(cb => favoriteIds.add(cb.value));
+            saveFavorites();
+            applyFavoriteStates();
+            showToast(`${checked.length} selected item(s) added to favorites and protected`, 'success');
+        }
+
+        function unfavoriteAll() {
+            if (favoriteIds.size === 0) {
+                showToast('No favorites to clear', 'info');
+                return;
+            }
+            const cleared = favoriteIds.size;
+            favoriteIds.clear();
+            saveFavorites();
+            applyFavoriteStates();
+            showToast(`${cleared} favorite(s) cleared`, 'info');
+        }
+
+        function renderChatSkeleton() {
+            const container = document.getElementById('chats-container');
+            const skeletonRow = `
+                <div class="flex items-center justify-between p-3.5 border-b border-slate-800/80 animate-pulse">
+                    <div class="flex items-center space-x-3">
+                        <div class="w-5 h-5 rounded bg-slate-800"></div>
+                        <div class="space-y-2">
+                            <div class="h-3 bg-slate-800 rounded w-40 sm:w-56"></div>
+                            <div class="h-2.5 bg-slate-800/70 rounded w-24 sm:w-32"></div>
+                        </div>
+                    </div>
+                    <div class="w-8 h-8 rounded-lg bg-slate-800/70"></div>
+                </div>
+            `;
+            container.innerHTML = Array.from({ length: 6 }).map(() => skeletonRow).join('') +
+                `<div class="p-4 text-center text-[11px] text-slate-500"><i class="fa-solid fa-spinner fa-spin mr-1.5"></i> Fetching your joined channels, groups and active bots...</div>`;
+        }
+
+        function initApp() {
+            restoreInputs();
+            favoriteIds = loadFavorites();
+        }
 
         function showCustomModal(title, message, type = 'info', onConfirm = null) {
             document.getElementById('modal-title').innerText = title;
@@ -805,7 +1080,7 @@ HTML_TEMPLATE = """
             };
 
             if (!data.api_id || !data.api_hash || !data.phone) {
-                showCustomModal("Validation Error", "Please fill in API ID, API Hash, and Phone Number before continuing.", "danger");
+                showToast('Please fill in API ID, API Hash, and Phone Number before continuing.', 'error');
                 return;
             }
 
@@ -825,16 +1100,18 @@ HTML_TEMPLATE = """
                     localStorage.setItem('tg_session_id', currentSessionId);
                     document.getElementById('step-auth').classList.add('hidden');
                     document.getElementById('step-verify').classList.remove('hidden');
+                    showToast('Login code sent — check your Telegram app for the code', 'success');
                 } else if (json.status === 'logged_in') {
                     currentSessionId = json.session_id;
                     localStorage.setItem('tg_session_id', currentSessionId);
                     document.getElementById('step-auth').classList.add('hidden');
+                    showToast('Session restored — loading your dialogs', 'success');
                     loadChatsList();
                 } else {
-                    showCustomModal("Connection Failed", json.message || "Failed to connect to Telegram.", "danger");
+                    showToast(json.message || 'Failed to connect to Telegram.', 'error');
                 }
             } catch (err) {
-                showCustomModal("Network Error", String(err), "danger");
+                showToast('Network error: ' + String(err), 'error');
             } finally {
                 btn.disabled = false;
                 btn.innerHTML = '<i class="fa-solid fa-list-check mr-2"></i> Connect & View My Dialogs';
@@ -864,12 +1141,13 @@ HTML_TEMPLATE = """
                     showCustomModal("2FA Required", "Your account is protected by 2-Step Verification. Please enter your 2FA password.", "info");
                 } else if (json.status === 'success') {
                     document.getElementById('step-verify').classList.add('hidden');
+                    showToast('Login verified — loading your dialogs', 'success');
                     loadChatsList();
                 } else {
-                    showCustomModal("Verification Failed", json.message || "Invalid OTP code or password.", "danger");
+                    showToast(json.message || 'Invalid OTP code or password.', 'error');
                 }
             } catch (err) {
-                showCustomModal("Network Error", String(err), "danger");
+                showToast('Network error: ' + String(err), 'error');
             } finally {
                 btn.disabled = false;
                 btn.innerHTML = '<i class="fa-solid fa-arrow-right mr-2"></i> Confirm Login & Show My Dialogs';
@@ -878,8 +1156,7 @@ HTML_TEMPLATE = """
 
         async function loadChatsList() {
             document.getElementById('step-select').classList.remove('hidden');
-            const container = document.getElementById('chats-container');
-            container.innerHTML = '<div class="p-8 text-center text-slate-400 text-sm"><i class="fa-solid fa-spinner fa-spin mr-2"></i> Fetching your joined channels, groups and active bots...</div>';
+            renderChatSkeleton();
 
             try {
                 const res = await fetch(`/api/dialogs/${currentSessionId}`);
@@ -888,10 +1165,12 @@ HTML_TEMPLATE = """
                     loadedChats = json.chats;
                     renderChats(loadedChats);
                 } else {
-                    container.innerHTML = `<div class="p-6 text-center text-rose-400">${json.message}</div>`;
+                    document.getElementById('chats-container').innerHTML = `<div class="p-6 text-center text-rose-400">${json.message}</div>`;
+                    showToast(json.message || 'Failed to load dialogs', 'error');
                 }
             } catch (e) {
-                container.innerHTML = `<div class="p-6 text-center text-rose-400">Failed to load dialogs: ${e}</div>`;
+                document.getElementById('chats-container').innerHTML = `<div class="p-6 text-center text-rose-400">Failed to load dialogs: ${e}</div>`;
+                showToast('Failed to load dialogs: ' + String(e), 'error');
             }
         }
 
@@ -913,33 +1192,41 @@ HTML_TEMPLATE = """
                     icon = 'fa-robot';
                 }
 
+                const isFav = favoriteIds.has(chat.id);
+                const safeName = escapeHtml(chat.name);
+
                 return `
-                <div class="chat-row flex items-center justify-between p-3 sm:p-3.5 border-b border-slate-800/80 hover:bg-slate-900/60 transition cursor-pointer select-none" onclick="toggleRow(event, '${chat.id}')">
-                    <div class="flex items-center space-x-3 min-w-0">
-                        <input type="checkbox" value="${chat.id}" data-type="${chat.type}" class="chat-checkbox w-5 h-5 sm:w-4 sm:h-4 rounded bg-slate-950 border-slate-700 text-cyan-500 focus:ring-0 focus:ring-offset-0 cursor-pointer" onclick="event.stopPropagation(); updateCount();">
+                <div class="chat-row flex items-center justify-between p-3 sm:p-3.5 border-b border-l-2 border-slate-800/80 ${isFav ? 'border-l-amber-400/70 bg-amber-950/10' : 'border-l-transparent'} hover:bg-slate-900/60 active:bg-slate-900 transition cursor-pointer select-none" data-id="${chat.id}" data-type="${chat.type}" data-fav="${isFav ? '1' : '0'}" onclick="toggleRow(event, '${chat.id}')">
+                    <div class="flex items-center space-x-3 min-w-0 flex-1">
+                        <input type="checkbox" value="${chat.id}" data-type="${chat.type}" ${isFav ? 'disabled' : ''} aria-label="Select ${safeName} for cleanup" class="chat-checkbox w-5 h-5 sm:w-4 sm:h-4 rounded bg-slate-950 border-slate-700 text-cyan-500 focus:ring-0 focus:ring-offset-0 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed" onclick="event.stopPropagation(); updateCount();">
                         <div class="min-w-0">
                             <p class="text-xs sm:text-sm font-medium text-slate-200 truncate flex items-center gap-1.5">
                                 <i class="fa-solid ${icon} text-[11px] text-slate-400"></i>
                                 <span class="truncate">${chat.name}</span>
+                                ${isFav ? '<i class="fa-solid fa-star text-[9px] text-amber-400 flex-shrink-0" title="Protected favorite"></i>' : ''}
                             </p>
                             <p class="text-[11px] sm:text-xs text-slate-500 flex items-center gap-1.5 sm:gap-2 truncate">
                                 <span class="text-slate-400 font-mono truncate">${chat.username ? '@' + chat.username : 'ID: ' + chat.id}</span>
                                 <span>•</span>
                                 <span class="px-1.5 sm:px-2 py-0.5 rounded text-[9px] sm:text-[10px] flex-shrink-0 ${badgeClass}">${chat.type}</span>
+                                ${isFav ? '<span class="px-1.5 sm:px-2 py-0.5 rounded text-[9px] sm:text-[10px] flex-shrink-0 bg-amber-950 text-amber-300 border border-amber-800/60">Protected</span>' : ''}
                             </p>
                         </div>
                     </div>
+                    <button type="button" data-fav-btn="${chat.id}" onclick="event.stopPropagation(); toggleFavorite('${chat.id}')" aria-pressed="${isFav}" aria-label="${isFav ? 'Remove' : 'Add'} ${safeName} ${isFav ? 'from' : 'to'} favorites" title="${isFav ? 'Unfavorite (unprotect)' : 'Favorite (protect from cleanup)'}" class="${FAV_BTN_BASE} ${isFav ? 'text-amber-400 bg-amber-950/50 border border-amber-500/40' : 'text-slate-600 hover:text-amber-400 hover:bg-slate-800 border border-transparent'}">
+                        <i class="${isFav ? 'fa-solid' : 'fa-regular'} fa-star" aria-hidden="true"></i>
+                    </button>
                 </div>
                 `;
             }).join('');
 
-            updateCount();
+            applyFavoriteStates();
         }
 
         function toggleRow(event, id) {
-            if (event.target.tagName === 'INPUT') return;
+            if (event.target.closest('input, button')) return;
             const cb = document.querySelector(`input[value="${id}"]`);
-            if (cb) {
+            if (cb && !cb.disabled) {
                 cb.checked = !cb.checked;
                 updateCount();
             }
@@ -954,6 +1241,7 @@ HTML_TEMPLATE = """
 
         function selectAll(state) {
             document.querySelectorAll('.chat-checkbox').forEach(cb => {
+                if (cb.disabled) return;
                 if (cb.closest('.chat-row').style.display !== 'none') {
                     cb.checked = state;
                 }
@@ -963,6 +1251,7 @@ HTML_TEMPLATE = """
 
         function selectByType(type) {
             document.querySelectorAll('.chat-checkbox').forEach(cb => {
+                if (cb.disabled) { cb.checked = false; return; }
                 if (cb.dataset.type && cb.dataset.type.includes(type)) {
                     cb.checked = true;
                 } else {
@@ -973,11 +1262,7 @@ HTML_TEMPLATE = """
         }
 
         function filterChats() {
-            const q = document.getElementById('search-input').value.toLowerCase();
-            document.querySelectorAll('.chat-row').forEach(row => {
-                const text = row.innerText.toLowerCase();
-                row.style.display = text.includes(q) ? 'flex' : 'none';
-            });
+            applyChatVisibility();
         }
 
         function promptConfirmLeaving() {
@@ -994,6 +1279,7 @@ HTML_TEMPLATE = """
 
             const minD = document.getElementById('step3-min-delay').value || 3;
             const maxD = document.getElementById('step3-max-delay').value || 6;
+            const favCount = favoriteIds.size;
 
             const breakdown = `
                 <div class="space-y-2">
@@ -1003,6 +1289,7 @@ HTML_TEMPLATE = """
                         ${groupCount > 0 ? `<li><b>${groupCount}</b> Groups (Leave)</li>` : ''}
                         ${botCount > 0 ? `<li><b>${botCount}</b> Bots (Stop & Complete Wipe)</li>` : ''}
                     </ul>
+                    ${favCount > 0 ? `<p class="text-xs text-amber-400 flex items-center gap-1.5 pt-1 border-t border-slate-800"><i class="fa-solid fa-star"></i> <b>${favCount}</b> favorites protected &mdash; excluded from cleanup.</p>` : ''}
                     <p class="text-xs text-cyan-400 pt-1">Execution Delay: ${minD} - ${maxD} seconds per item.</p>
                 </div>
             `;
@@ -1028,6 +1315,7 @@ HTML_TEMPLATE = """
                     body: JSON.stringify({
                         session_id: currentSessionId,
                         target_ids: checked,
+                        exclude_ids: Array.from(favoriteIds),
                         min_delay: minD,
                         max_delay: maxD
                     })
@@ -1039,13 +1327,14 @@ HTML_TEMPLATE = """
                     document.getElementById('live-speed-slider').value = minD;
                     document.getElementById('live-speed-val').innerText = minD + 's';
                     showProgress();
+                    showToast(`Cleanup task started for ${checked.length} item(s)`, 'success');
                 } else {
-                    showCustomModal("Task Failed", json.message || "Failed to start task.", "danger");
+                    showToast(json.message || 'Failed to start task.', 'error');
                     btn.disabled = false;
                     btn.innerHTML = '<i class="fa-solid fa-trash-can mr-2"></i> Leave & Clean Selected';
                 }
             } catch (err) {
-                showCustomModal("Network Error", String(err), "danger");
+                showToast('Network error: ' + String(err), 'error');
                 btn.disabled = false;
                 btn.innerHTML = '<i class="fa-solid fa-trash-can mr-2"></i> Leave & Clean Selected';
             }
@@ -1108,7 +1397,7 @@ HTML_TEMPLATE = """
 
         function exportLogs() {
             if (!currentLogs || currentLogs.length === 0) {
-                showCustomModal("Export Notice", "No logs available to export yet.", "info");
+                showToast('No logs available to export yet', 'info');
                 return;
             }
             const blob = new Blob([currentLogs.join('\\n')], { type: 'text/plain;charset=utf-8' });
@@ -1123,6 +1412,7 @@ HTML_TEMPLATE = """
         async function stopTask() {
             if (!currentTaskId) return;
             await fetch(`/api/task/stop/${currentTaskId}`, { method: 'POST' });
+            showToast('Stop requested — task will halt after the current item', 'info');
         }
 
         function returnToSelection() {
@@ -1136,7 +1426,7 @@ HTML_TEMPLATE = """
             loadChatsList();
         }
 
-        document.addEventListener('DOMContentLoaded', restoreInputs);
+        document.addEventListener('DOMContentLoaded', initApp);
     </script>
 </body>
 </html>
@@ -1310,6 +1600,7 @@ def start_task():
     data = request.json or {}
     session_id = data.get("session_id")
     target_ids = [str(x) for x in data.get("target_ids", [])]
+    exclude_ids = sorted({str(x) for x in (data.get("exclude_ids") or [])})
     min_delay = float(data.get("min_delay", 3.0))
     max_delay = float(data.get("max_delay", 6.0))
 
@@ -1328,7 +1619,8 @@ def start_task():
     tasks_store[task_id] = {
         "status": "starting", "total": len(selected_entities), "current_index": 0, "current_name": "",
         "min_delay": min_delay, "max_delay": max_delay, "current_delay": min_delay,
-        "left": 0, "failed": 0, "logs": [], "cancelled": False
+        "left": 0, "failed": 0, "protected": 0, "exclude_ids": exclude_ids,
+        "logs": [], "cancelled": False
     }
 
     asyncio.run_coroutine_threadsafe(
